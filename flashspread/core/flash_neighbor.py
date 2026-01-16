@@ -238,8 +238,8 @@ class FlashNeighbor:
             [N] tensor if single inducer state, [N, L] otherwise.
             Contains weighted count of neighbors in inducer states.
         """
-        if current_states.device != self.device:
-            raise ValueError("States must be on same device as graph")
+        if current_states.device.type != self.device.type:
+            raise ValueError("States must be on CUDA device")
         if current_states.dtype != torch.int32:
             current_states = current_states.to(torch.int32)
 
