@@ -1,0 +1,322 @@
+"""
+Renewal Engine for non-Markovian (age-dependent) spreading processes.
+
+This engine handles renewal processes where transition hazards depend on
+holding times (ages). Since all ages advance continuously, sparse updates
+are inapplicable and dense O(N) synchronous stepping is required.
+
+Features:
+- Age tracking per node with renewal reset on transition
+- Adaptive Bernoulli tau-leaping for tunable fidelity
+- erfcx-based numerically stable hazard evaluation
+- CUDA Graph support for maximum throughput
+"""
+
+import torch
+from typing import Tuple, Optional
+
+from ..core.graph import GraphCSR
+from ..core.flash_neighbor import FlashNeighbor
+
+
+class RenewalEngine:
+    """
+    GPU-accelerated non-Markovian epidemic simulation engine.
+
+    This engine implements adaptive Bernoulli tau-leaping for renewal
+    processes where transition hazards are age-dependent. The key difference
+    from Markovian simulation is that all node hazards change at every time
+    step (since ages advance), requiring dense updates.
+
+    Example:
+        >>> from flashspread import RenewalEngine, SEIRModel, FixedDegreeGraph
+        >>> graph = FixedDegreeGraph(10000, 15, device="cuda")
+        >>> model = SEIRModel(beta=0.3, mean_ei=5.0, median_ei=4.0,
+        ...                   mean_ir=3.9, median_ir=1.5)
+        >>> engine = RenewalEngine(graph, model, device="cuda")
+        >>> engine.seed_infection(100, state=1)  # Start with Exposed
+        >>> while engine.current_time < 50.0:
+        ...     engine.step()
+        >>> print(engine.count_by_state())
+    """
+
+    def __init__(
+        self,
+        graph,
+        model,
+        device: str | torch.device = "cuda",
+        epsilon: float = 0.03,
+        tau_max: float = 1.0,
+        seed: int = 12345,
+    ):
+        """
+        Initialize Renewal simulation engine.
+
+        Args:
+            graph: Network object with edge_index and csr attributes.
+            model: Non-Markovian compartmental model with age-dependent hazards.
+            device: PyTorch device.
+            epsilon: Accuracy parameter for adaptive step selection.
+                    Bounds maximum transition probability per step.
+            tau_max: Maximum time step (caps step size when rates are low).
+            seed: Random seed.
+        """
+        self.device = torch.device(device)
+        self.model = model
+        self.epsilon = float(epsilon)
+        self.tau_max = float(tau_max)
+
+        # Get graph data
+        if hasattr(graph, "csr"):
+            self.graph = graph.csr.to(self.device)
+            self.edge_index = graph.edge_index.to(self.device)
+        elif hasattr(graph, "row_ptr"):
+            self.graph = graph
+            self.edge_index = None
+        else:
+            raise ValueError("graph must have csr or row_ptr attribute")
+
+        self.num_nodes = self.graph.num_nodes
+
+        # Initialize FlashNeighbor kernel
+        self.inducer_states = model.inducer_states
+        self.flash_neighbor = FlashNeighbor(self.graph, self.inducer_states)
+
+        # State tensors
+        self.state = torch.zeros(self.num_nodes, device=self.device, dtype=torch.int32)
+        self.age = torch.zeros(self.num_nodes, device=self.device, dtype=torch.float32)
+        self.rates = torch.zeros(self.num_nodes, device=self.device, dtype=torch.float32)
+        self.pressure = torch.zeros(self.num_nodes, device=self.device, dtype=torch.float32)
+
+        # Working buffers
+        self.event_prob = torch.zeros(self.num_nodes, device=self.device, dtype=torch.float32)
+        self.event_mask = torch.zeros(self.num_nodes, device=self.device, dtype=torch.bool)
+        self.next_state = torch.zeros(self.num_nodes, device=self.device, dtype=torch.int32)
+        self.rand_buffer = torch.zeros(self.num_nodes, device=self.device, dtype=torch.float32)
+
+        # Scalar tensors for CUDA Graph compatibility
+        self.tau = torch.zeros(1, device=self.device, dtype=torch.float32)
+        self.epsilon_t = torch.tensor(self.epsilon, device=self.device, dtype=torch.float32)
+        self.tau_max_t = torch.tensor(self.tau_max, device=self.device, dtype=torch.float32)
+        self.min_rate_t = torch.tensor(1e-9, device=self.device, dtype=torch.float32)
+
+        # RNG state using simple counter-based approach for reproducibility
+        self.seed_counter = (
+            torch.arange(self.num_nodes, device=self.device, dtype=torch.int64)
+            + int(seed) * 1000003
+        )
+        self.inv_uint32 = torch.tensor(1.0 / (2.0**32), device=self.device, dtype=torch.float32)
+
+        # Simulation state
+        self.current_time = 0.0
+        self.total_steps = 0
+
+        # Prepare model parameters on device
+        if hasattr(self.model, "prepare"):
+            self.model.prepare(self.device)
+
+    def reset(self) -> None:
+        """Reset simulation to initial state."""
+        self.state.zero_()
+        self.age.zero_()
+        self.rates.zero_()
+        self.pressure.zero_()
+        self.current_time = 0.0
+        self.total_steps = 0
+
+    def seed_infection(self, num_infected: int, state: int = None) -> None:
+        """
+        Randomly seed initial infections.
+
+        Args:
+            num_infected: Number of nodes to infect.
+            state: Target state (default: first non-susceptible state).
+        """
+        if state is None:
+            state = 1  # Typically Exposed or Infected
+
+        indices = torch.randperm(self.num_nodes, device=self.device)[:num_infected]
+        self.state[indices] = state
+        self.age[indices] = 0.0  # Fresh entry into state
+
+    def set_initial_state(
+        self, initial_state: torch.Tensor, initial_age: torch.Tensor = None
+    ) -> None:
+        """
+        Set initial state and optionally ages.
+
+        Args:
+            initial_state: [N] tensor of states.
+            initial_age: [N] tensor of ages (default: all zeros).
+        """
+        self.state.copy_(initial_state.to(self.device, dtype=torch.int32))
+        if initial_age is not None:
+            self.age.copy_(initial_age.to(self.device, dtype=torch.float32))
+        else:
+            self.age.zero_()
+
+    def _xorshift32(self, x: torch.Tensor) -> torch.Tensor:
+        """XorShift32 PRNG for fast uniform random generation."""
+        x = x ^ ((x << 13) & 0xFFFFFFFF)
+        x = x ^ (x >> 17)
+        x = x ^ ((x << 5) & 0xFFFFFFFF)
+        return x & 0xFFFFFFFF
+
+    def _rand_uniform(self, out: torch.Tensor) -> torch.Tensor:
+        """Generate uniform random numbers using counter-based RNG."""
+        self.seed_counter.copy_(self._xorshift32(self.seed_counter))
+        out.copy_(self.seed_counter.to(dtype=torch.float32) * self.inv_uint32)
+        out.clamp_(min=1e-12, max=1.0 - 1e-7)
+        return out
+
+    def _step_impl(self) -> torch.Tensor:
+        """
+        Internal step implementation for CUDA Graph compatibility.
+
+        Returns tau as a tensor (not scalar) for graph capture.
+        """
+        # Step 1: Compute pressure (influence from infectious neighbors)
+        pressure = self.flash_neighbor.compute_influence(self.state)
+        if pressure.dim() > 1:
+            pressure = pressure.sum(dim=1)
+        self.pressure.copy_(pressure)
+
+        # Step 2: Compute hazard rates
+        self.model.compute_rates(self.age, self.state, self.pressure, out=self.rates)
+
+        # Step 3: Adaptive step selection
+        max_rate = self.rates.max()
+        tau_candidate = self.epsilon_t / (max_rate + 1e-12)
+        tau = torch.minimum(tau_candidate, self.tau_max_t)
+        tau = torch.where(max_rate < self.min_rate_t, self.tau_max_t, tau)
+        self.tau.copy_(tau)
+
+        # Step 4: Compute transition probabilities (Bernoulli)
+        # p = 1 - exp(-lambda * tau)
+        self.event_prob.copy_(self.rates)
+        self.event_prob.mul_(self.tau)
+        self.event_prob.neg_().exp_()  # exp(-rate * tau)
+        self.event_prob.neg_().add_(1.0)  # 1 - exp(...)
+
+        # Step 5: Sample Bernoulli transitions
+        self._rand_uniform(self.rand_buffer)
+        torch.lt(self.rand_buffer, self.event_prob, out=self.event_mask)
+
+        # Step 6: Apply transitions and renewal reset
+        self.age.add_(self.tau)  # All ages advance
+        self.model.apply_transitions(self.state, self.event_mask, out=self.next_state)
+
+        # Reset age to 0 for nodes that transitioned (renewal property)
+        changed = self.next_state != self.state
+        self.age.masked_fill_(changed, 0.0)
+        self.state.copy_(self.next_state)
+
+        return self.tau
+
+    def step(self) -> Tuple[float, torch.Tensor]:
+        """
+        Execute one adaptive tau-leaping step.
+
+        Returns:
+            Tuple of (elapsed_time, current_state).
+        """
+        tau = float(self._step_impl().item())
+        self.current_time += tau
+        self.total_steps += 1
+        return tau, self.state
+
+    def simulate_until(self, target_time: float) -> None:
+        """
+        Simulate until target time is reached.
+
+        Args:
+            target_time: Simulation end time.
+        """
+        while self.current_time < target_time:
+            self.step()
+
+    def count_by_state(self) -> torch.Tensor:
+        """Return counts for each state."""
+        return torch.bincount(self.state, minlength=self.model.num_states)
+
+    def count_infected(self) -> int:
+        """Return number of nodes in inducer states."""
+        count = 0
+        for state_idx in self.inducer_states:
+            count += (self.state == state_idx).sum().item()
+        return count
+
+
+class RenewalEngineCUDAGraph(RenewalEngine):
+    """
+    CUDA Graph optimized version of Renewal Engine.
+
+    This class captures the step() operation as a CUDA Graph for
+    reduced kernel launch overhead. Multiple steps are batched into
+    a single graph replay.
+
+    Note: CUDA Graphs require static tensor shapes and control flow.
+    The sparse hazard evaluation mode is disabled in favor of dense
+    evaluation which is more compatible with graph capture.
+    """
+
+    def __init__(self, *args, steps_per_launch: int = 50, **kwargs):
+        """
+        Initialize CUDA Graph engine.
+
+        Args:
+            *args: Arguments passed to RenewalEngine.
+            steps_per_launch: Number of steps per CUDA Graph replay.
+            **kwargs: Keyword arguments passed to RenewalEngine.
+        """
+        super().__init__(*args, **kwargs)
+
+        if self.device.type != "cuda":
+            raise RuntimeError("RenewalEngineCUDAGraph requires CUDA device")
+
+        # Disable sparse hazard mode for CUDA Graph compatibility
+        if hasattr(self.model, "sparse_hazard"):
+            self.model.sparse_hazard = False
+
+        self.steps_per_launch = int(steps_per_launch)
+        self.step_time_accumulator = torch.zeros(1, device=self.device, dtype=torch.float32)
+
+        # Capture the graph
+        self.graph_exec = None
+        self._capture_graph()
+
+    def _static_step(self) -> None:
+        """Single step for CUDA Graph capture (no return value)."""
+        tau = self._step_impl()
+        self.step_time_accumulator.add_(tau)
+
+    def _capture_graph(self) -> None:
+        """Capture CUDA Graph of multiple steps."""
+        # Warmup runs
+        for _ in range(3):
+            self._static_step()
+        torch.cuda.synchronize()
+
+        # Capture graph
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(self.steps_per_launch):
+                self._static_step()
+
+        self.graph_exec = g
+
+    def step(self) -> Tuple[float, torch.Tensor]:
+        """
+        Execute steps_per_launch steps via CUDA Graph replay.
+
+        Returns:
+            Tuple of (total_elapsed_time, current_state).
+        """
+        self.step_time_accumulator.zero_()
+        self.graph_exec.replay()
+
+        elapsed = float(self.step_time_accumulator.item())
+        self.current_time += elapsed
+        self.total_steps += self.steps_per_launch
+
+        return elapsed, self.state
