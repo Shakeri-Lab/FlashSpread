@@ -331,13 +331,15 @@ class SEIRModel:
                 )
         else:
             # Dense computation (for CUDA Graph compatibility)
+            # Must modify out in-place since caller may ignore return value
             hazard_e = lognormal_hazard_stable(age, self._mu_ei, self._sig_ei)
             hazard_i = lognormal_hazard_stable(age, self._mu_ir, self._sig_ir)
             rate_s = pressure * self._beta_t
 
-            out = torch.where(s_mask, rate_s, out)
-            out = torch.where(e_mask, hazard_e, out)
-            out = torch.where(i_mask, hazard_i, out)
+            # Use in-place operations for CUDA Graph compatibility
+            out.copy_(torch.where(s_mask, rate_s, out))
+            out.copy_(torch.where(e_mask, hazard_e, out))
+            out.copy_(torch.where(i_mask, hazard_i, out))
 
         return out
 

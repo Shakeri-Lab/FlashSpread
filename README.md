@@ -116,7 +116,7 @@ FlashSpread achieves high throughput through GPU acceleration and optimized memo
 | **RenewalEngine** | 1M nodes, 15M edges | ~710 steps/sec | ~2 GB |
 | **MarkovianEngine** | 1M nodes, 15M edges | ~1,200 steps/sec | ~2 GB |
 
-**Key optimization: CUDA Graph batching provides ~8x speedup** by amortizing kernel launch overhead across multiple simulation steps.
+**Key optimization: CUDA Graph batching provides ~5.7x speedup** by amortizing kernel launch overhead across multiple simulation steps.
 
 ### Roofline Analysis (A100)
 
@@ -139,13 +139,13 @@ Individual optimization contributions (100K nodes, degree 15):
 | Optimization | Speedup | Notes |
 |--------------|---------|-------|
 | Baseline | 1.0x | RenewalEngine, no optimizations |
-| RCM Reordering | 1.04x | Better cache locality |
-| Fused Operations | 1.03x | Reduced kernel launches |
+| RCM Reordering | 1.01x | Better cache locality |
+| Fused Operations | 0.99x | Minor overhead |
 | Block Size 256 | 1.02x | Better occupancy |
-| **CUDA Graph (50 steps)** | **8.1x** | Amortized launch overhead |
-| RCM + CUDA Graph | 8.25x | Combined benefits |
+| **CUDA Graph (50 steps)** | **5.7x** | Amortized launch overhead |
+| RCM + CUDA Graph | 5.8x | Combined benefits |
 
-**Recommendation:** Always use `RenewalEngineCUDAGraph` with `steps_per_launch=50-100` for best performance.
+**Recommendation:** Use `RenewalEngineCUDAGraph` with `steps_per_launch=50` for best accuracy/speed tradeoff. Higher batch sizes (100) may have increased stochastic variance.
 
 ---
 
@@ -161,7 +161,7 @@ from flashspread.engines import create_renewal_engine
 # Recommended configuration
 engine = create_renewal_engine(
     graph, model,
-    use_cuda_graph=True,      # 8x speedup
+    use_cuda_graph=True,      # ~5.7x speedup
     epsilon=0.03,             # Accuracy/speed balance
     steps_per_launch=50,      # Optimal batch size
 )

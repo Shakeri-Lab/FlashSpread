@@ -10,46 +10,38 @@
 - RL evaluation configuration (accurate: `epsilon=0.01, tau_max=0.5`)
 - Benchmarking instructions
 
-### Ablation Study Bug Fixes
+### Bug Fixes (2026-01-23)
 
-1. **Step count normalization** - CUDA Graph configs were running more total simulation steps than baseline (200*50=10000 vs 200). Now all configs run the same total simulation steps.
+1. **Step count normalization** - CUDA Graph configs were running more total simulation steps than baseline. Now all configs run the same total simulation steps.
 
 2. **JSON serialization** - Fixed `numpy.bool_` not JSON serializable by converting to Python native types.
 
+3. **CUDA Graph dense mode (FIXED)** - `SEIRModel.compute_rates()` dense mode was using `torch.where()` which creates new tensors instead of modifying in-place. Fixed to use `out.copy_(torch.where(...))` for proper CUDA Graph compatibility.
+
 ---
 
-## Ablation Study Results (Job 7378715 - COMPLETED)
+## Ablation Study Results (Job 7379061 - FIXED)
 
 | ID | Config | ms/step | Speedup | Infected | AccErr% | Pass |
 |----|--------|---------|---------|----------|---------|------|
-| 0 | baseline | 1.382 | 1.00x | 1367 | 0.0 | Y |
-| 1 | rcm_only | 1.416 | 0.98x | 1350 | 1.2 | Y |
-| 2 | fused_only | 1.353 | 1.02x | 1331 | 2.6 | Y |
-| 3 | block_256 | 1.353 | 1.02x | 1383 | 1.2 | Y |
-| 4 | **cuda_graph_only** | **0.216** | **6.41x** | **0** | 100.0 | **N** |
-| 5 | rcm_fused | 1.418 | 0.97x | 1387 | 1.5 | Y |
-| 6 | rcm_cuda_graph | 0.212 | 6.52x | 0 | 100.0 | N |
-| 7 | all_optimizations | 0.214 | 6.47x | 0 | 100.0 | N |
-| 8 | cuda_graph_100 | 0.215 | 6.44x | 0 | 100.0 | N |
-| 9 | all_opt_100 | 0.211 | 6.56x | 0 | 100.0 | N |
+| 0 | baseline | 1.409 | 1.00x | 1369 | 0.0 | Y |
+| 1 | rcm_only | 1.391 | 1.01x | 1372 | 0.3 | Y |
+| 2 | fused_only | 1.417 | 0.99x | 1380 | 0.8 | Y |
+| 3 | block_256 | 1.381 | 1.02x | 1365 | 0.3 | Y |
+| 4 | **cuda_graph_only** | **0.249** | **5.65x** | **1300** | 5.0 | **Y** |
+| 5 | rcm_fused | 1.394 | 1.01x | 1351 | 1.3 | Y |
+| 6 | **rcm_cuda_graph** | **0.243** | **5.79x** | **1426** | 4.2 | **Y** |
+| 7 | **all_optimizations** | **0.242** | **5.82x** | **1383** | 1.0 | **Y** |
+| 8 | cuda_graph_100 | 0.254 | 5.54x | 1642 | 19.9 | N |
+| 9 | all_opt_100 | 0.245 | 5.76x | 1667 | 21.8 | N |
 
 ### Key Findings
 
-1. **Non-CUDA Graph optimizations**: Marginal speedups (0.97x-1.02x), all pass accuracy
-2. **CUDA Graph optimizations**: 6.4x-6.6x speedup BUT **all fail accuracy** (0 infected)
+1. **CUDA Graph (steps_per_launch=50)**: ~5.7x speedup, **all pass accuracy**
+2. **CUDA Graph (steps_per_launch=100)**: ~5.6x speedup, higher variance (~20% error)
+3. **Other optimizations**: Marginal (0.99x-1.02x)
 
-### CRITICAL BUG: CUDA Graph Accuracy Failure
-
-**All CUDA Graph configs show 0 final infected vs ~1367 for baseline** (same 200 simulation steps).
-
-**Likely cause:** CUDA Graph captures RNG state and replays same random numbers, causing deterministic behavior that kills the epidemic.
-
-**Action needed:** Investigate `RenewalEngineCUDAGraph` RNG handling - may need to:
-- Update RNG state between graph replays
-- Use different random seed strategy
-- Or disable CUDA Graph for stochastic simulations
-
-**For now:** Use `RenewalEngine` (non-CUDA Graph) for accurate simulations
+**Recommendation:** Use `RenewalEngineCUDAGraph` with `steps_per_launch=50` for best accuracy/speed tradeoff
 
 ---
 
@@ -93,16 +85,15 @@
 
 ### Renewal Engine (Non-Markovian SEIR) - Best Practices
 
-**WARNING:** CUDA Graph has accuracy issues - use `RenewalEngine` until fixed.
-
 ```python
-from flashspread.engines.renewal import RenewalEngine
+from flashspread.engines.renewal import RenewalEngineCUDAGraph
 
-# RECOMMENDED: Use non-CUDA Graph for accurate simulations
-engine = RenewalEngine(
+# RECOMMENDED: Use CUDA Graph for ~5.7x speedup
+engine = RenewalEngineCUDAGraph(
     graph, model, device="cuda",
     epsilon=0.03,         # Accuracy parameter (smaller = more steps, more accurate)
     tau_max=1.0,          # Max time step
+    steps_per_launch=50,  # Optimal batch size (100 has higher variance)
 )
 ```
 
@@ -111,6 +102,7 @@ engine = RenewalEngine(
 |-----------|--------|----------------|
 | `epsilon` | Controls step size accuracy | 0.03 (default) good balance |
 | `tau_max` | Maximum time step | 1.0 for stability |
+| `steps_per_launch` | CUDA Graph batch | 50 (100 has ~20% variance) |
 
 ### Markovian Engine (SIS/SIR) - Best Practices
 
@@ -170,8 +162,8 @@ docs/
 ```python
 from flashspread.engines import create_renewal_engine, create_markovian_engine
 
-# WARNING: use_cuda_graph=False until CUDA Graph accuracy bug is fixed
-engine = create_renewal_engine(graph, model, use_cuda_graph=False)
+# RECOMMENDED: CUDA Graph with steps_per_launch=50 for ~5.7x speedup
+engine = create_renewal_engine(graph, model, use_cuda_graph=True, steps_per_launch=50)
 
 # For Markovian models
 engine = create_markovian_engine(graph, model)
