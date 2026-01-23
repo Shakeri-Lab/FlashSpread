@@ -16,34 +16,40 @@
 
 2. **JSON serialization** - Fixed `numpy.bool_` not JSON serializable by converting to Python native types.
 
-### Active Job: Ablation Study (Re-run)
-
-**Job ID:** `7378715` (array 0-9)
-**Status:** Pending GPU resources
-
-```bash
-# Monitor
-squeue -j 7378715
-tail -f logs/flashspread_ablation-7378715_*.out
-
-# After completion
-sbatch slurm/merge_ablation_results.sbatch
-cat results/ablation/ablation_summary.md
-```
-
 ---
 
-## Ablation Study Results (Pending - Job 7378715)
+## Ablation Study Results (Job 7378715 - COMPLETED)
 
-| Config | ms/step | Speedup | Notes |
-|--------|---------|---------|-------|
-| baseline | 1.408 | 1.0x | Reference |
-| rcm_only | 1.361 | 1.04x | Cache locality |
-| fused_only | 1.374 | 1.03x | Fewer kernel launches |
-| block_256 | 1.375 | 1.02x | Better occupancy |
-| **cuda_graph_only** | **0.174** | **~8x** | Launch overhead eliminated |
+| ID | Config | ms/step | Speedup | Infected | AccErr% | Pass |
+|----|--------|---------|---------|----------|---------|------|
+| 0 | baseline | 1.382 | 1.00x | 1367 | 0.0 | Y |
+| 1 | rcm_only | 1.416 | 0.98x | 1350 | 1.2 | Y |
+| 2 | fused_only | 1.353 | 1.02x | 1331 | 2.6 | Y |
+| 3 | block_256 | 1.353 | 1.02x | 1383 | 1.2 | Y |
+| 4 | **cuda_graph_only** | **0.216** | **6.41x** | **0** | 100.0 | **N** |
+| 5 | rcm_fused | 1.418 | 0.97x | 1387 | 1.5 | Y |
+| 6 | rcm_cuda_graph | 0.212 | 6.52x | 0 | 100.0 | N |
+| 7 | all_optimizations | 0.214 | 6.47x | 0 | 100.0 | N |
+| 8 | cuda_graph_100 | 0.215 | 6.44x | 0 | 100.0 | N |
+| 9 | all_opt_100 | 0.211 | 6.56x | 0 | 100.0 | N |
 
-**Key finding:** CUDA Graph provides ~8x speedup per simulation step. Other optimizations provide minor incremental benefits.
+### Key Findings
+
+1. **Non-CUDA Graph optimizations**: Marginal speedups (0.97x-1.02x), all pass accuracy
+2. **CUDA Graph optimizations**: 6.4x-6.6x speedup BUT **all fail accuracy** (0 infected)
+
+### CRITICAL BUG: CUDA Graph Accuracy Failure
+
+**All CUDA Graph configs show 0 final infected vs ~1367 for baseline** (same 200 simulation steps).
+
+**Likely cause:** CUDA Graph captures RNG state and replays same random numbers, causing deterministic behavior that kills the epidemic.
+
+**Action needed:** Investigate `RenewalEngineCUDAGraph` RNG handling - may need to:
+- Update RNG state between graph replays
+- Use different random seed strategy
+- Or disable CUDA Graph for stochastic simulations
+
+**For now:** Use `RenewalEngine` (non-CUDA Graph) for accurate simulations
 
 ---
 
@@ -87,15 +93,16 @@ cat results/ablation/ablation_summary.md
 
 ### Renewal Engine (Non-Markovian SEIR) - Best Practices
 
-```python
-from flashspread.engines.renewal import RenewalEngineCUDAGraph
+**WARNING:** CUDA Graph has accuracy issues - use `RenewalEngine` until fixed.
 
-# Optimal for throughput
-engine = RenewalEngineCUDAGraph(
+```python
+from flashspread.engines.renewal import RenewalEngine
+
+# RECOMMENDED: Use non-CUDA Graph for accurate simulations
+engine = RenewalEngine(
     graph, model, device="cuda",
     epsilon=0.03,         # Accuracy parameter (smaller = more steps, more accurate)
     tau_max=1.0,          # Max time step
-    steps_per_launch=50,  # CUDA Graph batching - KEY for performance (2.8x speedup)
 )
 ```
 
@@ -104,7 +111,6 @@ engine = RenewalEngineCUDAGraph(
 |-----------|--------|----------------|
 | `epsilon` | Controls step size accuracy | 0.03 (default) good balance |
 | `tau_max` | Maximum time step | 1.0 for stability |
-| `steps_per_launch` | CUDA Graph batch size | 50-100 for best throughput |
 
 ### Markovian Engine (SIS/SIR) - Best Practices
 
@@ -159,13 +165,13 @@ docs/
 └── PERFORMANCE_ANALYSIS.md   # Comprehensive performance documentation
 ```
 
-## Factory Functions (New)
+## Factory Functions
 
 ```python
 from flashspread.engines import create_renewal_engine, create_markovian_engine
 
-# Recommended: Uses CUDA Graph with optimal defaults
-engine = create_renewal_engine(graph, model, use_cuda_graph=True)
+# WARNING: use_cuda_graph=False until CUDA Graph accuracy bug is fixed
+engine = create_renewal_engine(graph, model, use_cuda_graph=False)
 
 # For Markovian models
 engine = create_markovian_engine(graph, model)
