@@ -413,9 +413,9 @@ def run_ablation_experiment(
         accuracy_error_pct = 0.0
 
     # Accuracy passes if within 10% of baseline (stochastic variance expected)
-    accuracy_passed = accuracy_error_pct < 10.0
+    accuracy_passed = bool(accuracy_error_pct < 10.0)
 
-    time_per_step_ms = mean_wall_time * 1000 / steps_done
+    time_per_step_ms = float(mean_wall_time * 1000 / steps_done)
 
     result = AblationResult(
         config_name=config.name,
@@ -429,16 +429,16 @@ def run_ablation_experiment(
         num_edges=graph.num_edges,
         graph_bandwidth_before=bw_before,
         graph_bandwidth_after=bw_after,
-        total_wall_time_s=mean_wall_time,
-        steps_executed=steps_done,
+        total_wall_time_s=float(mean_wall_time),
+        steps_executed=int(steps_done),
         time_per_step_ms=time_per_step_ms,
-        steps_per_second=steps_done / mean_wall_time,
-        speedup_vs_baseline=speedup,
-        final_infected_mean=final_infected_mean,
-        final_infected_std=final_infected_std,
-        final_infected_ref=final_infected_ref,
-        accuracy_error_percent=accuracy_error_pct,
-        max_trajectory_diff=max_traj_diff,
+        steps_per_second=float(steps_done / mean_wall_time),
+        speedup_vs_baseline=float(speedup),
+        final_infected_mean=float(final_infected_mean),
+        final_infected_std=float(final_infected_std),
+        final_infected_ref=float(final_infected_ref),
+        accuracy_error_percent=float(accuracy_error_pct),
+        max_trajectory_diff=float(max_traj_diff),
         accuracy_passed=accuracy_passed,
     )
 
