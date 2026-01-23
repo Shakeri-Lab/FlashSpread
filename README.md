@@ -104,6 +104,233 @@ FlashSpread uses a dual-engine architecture:
 
 Both engines share the **FlashNeighbor** kernel for efficient influence computation.
 
+## Performance and Benchmarking
+
+### Performance Overview
+
+FlashSpread achieves high throughput through GPU acceleration and optimized memory access patterns:
+
+| Engine | Graph Size | Throughput | GPU Memory |
+|--------|------------|------------|------------|
+| **RenewalEngineCUDAGraph** | 1M nodes, 15M edges | ~5,800 steps/sec | ~2 GB |
+| **RenewalEngine** | 1M nodes, 15M edges | ~710 steps/sec | ~2 GB |
+| **MarkovianEngine** | 1M nodes, 15M edges | ~1,200 steps/sec | ~2 GB |
+
+**Key optimization: CUDA Graph batching provides ~8x speedup** by amortizing kernel launch overhead across multiple simulation steps.
+
+### Roofline Analysis (A100)
+
+The algorithm is **memory-bound** on modern GPUs:
+
+| Metric | Value |
+|--------|-------|
+| A100 CUDA Core FP32 | 19.5 TFLOPS |
+| A100 Memory Bandwidth | 2039 GB/s |
+| Ridge Point | 9.6 FLOPs/byte |
+| Achieved Arithmetic Intensity | 0.6-1.3 FLOPs/byte |
+| Achieved Efficiency | 3-10% (typical for sparse irregular workloads) |
+
+**Note:** Tensor cores cannot be utilized due to sparse irregular memory access patterns and transcendental operations (erfcx for log-normal hazards).
+
+### Ablation Study Results
+
+Individual optimization contributions (100K nodes, degree 15):
+
+| Optimization | Speedup | Notes |
+|--------------|---------|-------|
+| Baseline | 1.0x | RenewalEngine, no optimizations |
+| RCM Reordering | 1.04x | Better cache locality |
+| Fused Operations | 1.03x | Reduced kernel launches |
+| Block Size 256 | 1.02x | Better occupancy |
+| **CUDA Graph (50 steps)** | **8.1x** | Amortized launch overhead |
+| RCM + CUDA Graph | 8.25x | Combined benefits |
+
+**Recommendation:** Always use `RenewalEngineCUDAGraph` with `steps_per_launch=50-100` for best performance.
+
+---
+
+## Scale Guidelines
+
+### Moderate Graphs (100K - 1M nodes)
+
+Suitable for most research and RL training scenarios.
+
+```python
+from flashspread.engines import create_renewal_engine
+
+# Recommended configuration
+engine = create_renewal_engine(
+    graph, model,
+    use_cuda_graph=True,      # 8x speedup
+    epsilon=0.03,             # Accuracy/speed balance
+    steps_per_launch=50,      # Optimal batch size
+)
+```
+
+**Memory requirement:** ~2 GB for 1M nodes with degree 15
+
+### Large Graphs (1M - 10M nodes)
+
+For population-scale simulations. Requires careful memory management.
+
+```python
+from flashspread import FixedDegreeGraph, SEIRModel
+from flashspread.engines import RenewalEngineCUDAGraph
+
+# Large graph setup
+graph = FixedDegreeGraph(
+    num_nodes=10_000_000,
+    degree=15,
+    device="cuda"
+)
+
+model = SEIRModel(beta=0.3, mean_ei=5.0, median_ei=4.0, mean_ir=3.9, median_ir=1.5)
+
+# Use larger epsilon for scalability
+engine = RenewalEngineCUDAGraph(
+    graph, model,
+    device="cuda",
+    epsilon=0.05,            # Slightly less accurate, faster
+    tau_max=2.0,             # Allow larger time steps
+    steps_per_launch=100,    # Maximize batching benefit
+)
+```
+
+**Memory requirement:** ~20 GB for 10M nodes (A100 40GB recommended)
+
+### Very Large Graphs (10M+ nodes)
+
+For city/country-scale simulations. Consider:
+
+1. **Multi-GPU distribution** (future feature)
+2. **Subgraph sampling** for training
+3. **Increased epsilon** for tractable step counts
+
+```python
+# Very large scale (use with caution)
+engine = RenewalEngineCUDAGraph(
+    graph, model,
+    epsilon=0.1,             # Trade accuracy for speed
+    tau_max=5.0,             # Larger time steps
+    steps_per_launch=100,
+)
+```
+
+**Memory scaling:** `Memory (GB) ≈ N × 0.00002 + E × 0.000008`
+
+---
+
+## Reinforcement Learning Integration
+
+FlashSpread supports both fast approximate simulations for training and accurate simulations for evaluation.
+
+### RL Training Configuration (Fast, Less Accurate)
+
+For gradient-based RL training, prioritize simulation speed over accuracy:
+
+```python
+from flashspread.engines import create_renewal_engine
+
+def create_training_env(graph, model):
+    """Create fast simulator for RL training."""
+    return create_renewal_engine(
+        graph, model,
+        use_cuda_graph=True,
+        epsilon=0.1,             # Larger epsilon = bigger steps, faster
+        tau_max=2.0,             # Allow larger leaps
+        steps_per_launch=100,    # Maximum batching
+    )
+
+# Training loop
+env = create_training_env(graph, model)
+for episode in range(num_episodes):
+    env.reset()
+    while not done:
+        action = policy(state)
+        env.apply_control(action)  # Your control interface
+        for _ in range(sim_steps_per_action):
+            env.step()
+        reward = compute_reward(env)
+        # ... RL update
+```
+
+**Tradeoffs:**
+- `epsilon=0.1`: ~3x faster than `epsilon=0.03`, but larger discretization error
+- `tau_max=2.0`: Allows larger time jumps, may miss rapid transitions
+- `steps_per_launch=100`: Best for long simulations (>1000 steps)
+
+### RL Evaluation Configuration (Accurate)
+
+For policy evaluation and final testing, prioritize accuracy:
+
+```python
+def create_evaluation_env(graph, model):
+    """Create accurate simulator for RL evaluation."""
+    return create_renewal_engine(
+        graph, model,
+        use_cuda_graph=True,     # Still use for speed
+        epsilon=0.01,            # Small epsilon = accurate
+        tau_max=0.5,             # Conservative time steps
+        steps_per_launch=50,     # Balanced batching
+    )
+
+# Evaluation
+env = create_evaluation_env(graph, model)
+results = []
+for seed in range(num_eval_runs):
+    env.reset()
+    trajectory = []
+    while env.current_time < T_max:
+        env.step()
+        trajectory.append(env.count_by_state())
+    results.append(trajectory)
+```
+
+**Accuracy tips:**
+- Use `epsilon=0.01` for publication-quality results
+- Run multiple seeds (5-10) to quantify stochastic variance
+- Validate against analytical solutions for simple models (SIS endemic)
+
+### Configuration Comparison
+
+| Setting | Training | Evaluation |
+|---------|----------|------------|
+| `epsilon` | 0.05-0.1 | 0.01-0.03 |
+| `tau_max` | 1.0-2.0 | 0.5-1.0 |
+| `steps_per_launch` | 100 | 50 |
+| Relative speed | 1.0x | 0.3-0.5x |
+| Use case | Gradient updates | Final metrics |
+
+---
+
+## Benchmarking Your Setup
+
+Run the roofline benchmark to characterize performance on your hardware:
+
+```bash
+# Single configuration test
+python experiments/benchmark_roofline.py --config renewal_batched_50 --num-nodes 1000000
+
+# Full benchmark suite (SLURM)
+sbatch slurm/run_roofline_array.sbatch
+sbatch slurm/merge_roofline_results.sbatch  # After completion
+
+# View results
+cat results/roofline_summary.md
+```
+
+For optimization ablation:
+
+```bash
+sbatch slurm/run_ablation_study.sbatch
+sbatch slurm/merge_ablation_results.sbatch
+cat results/ablation/ablation_summary.md
+```
+
+See [docs/PERFORMANCE_ANALYSIS.md](docs/PERFORMANCE_ANALYSIS.md) for detailed performance documentation.
+
+---
+
 ## SLURM Execution
 
 For HPC environments with SLURM:
@@ -114,7 +341,15 @@ sbatch slurm/run_markovian.sbatch
 
 # Non-Markovian simulation
 sbatch slurm/run_renewal.sbatch
+
+# Performance benchmarking
+sbatch slurm/run_roofline_array.sbatch
+
+# Optimization ablation study
+sbatch slurm/run_ablation_study.sbatch
 ```
+
+---
 
 ## Citation
 
