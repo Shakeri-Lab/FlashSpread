@@ -10,20 +10,30 @@
 - RL evaluation configuration (accurate: `epsilon=0.01, tau_max=0.5`)
 - Benchmarking instructions
 
-### Ablation Study Bug Fix
+### Ablation Study Bug Fixes
 
-Fixed `experiments/ablation_study.py` - CUDA Graph configs were running more total simulation steps than baseline (200*50=10000 vs 200). Now all configs run the same total simulation steps for fair comparison.
+1. **Step count normalization** - CUDA Graph configs were running more total simulation steps than baseline (200*50=10000 vs 200). Now all configs run the same total simulation steps.
 
-**To re-run ablation with fix:**
+2. **JSON serialization** - Fixed `numpy.bool_` not JSON serializable by converting to Python native types.
+
+### Active Job: Ablation Study (Re-run)
+
+**Job ID:** `7378715` (array 0-9)
+**Status:** Pending GPU resources
+
 ```bash
-rm results/ablation/ablation_*.json
-sbatch slurm/run_ablation_study.sbatch
-sbatch slurm/merge_ablation_results.sbatch  # After completion
+# Monitor
+squeue -j 7378715
+tail -f logs/flashspread_ablation-7378715_*.out
+
+# After completion
+sbatch slurm/merge_ablation_results.sbatch
+cat results/ablation/ablation_summary.md
 ```
 
 ---
 
-## Ablation Study Results (Partial - Pre-Fix)
+## Ablation Study Results (Pending - Job 7378715)
 
 | Config | ms/step | Speedup | Notes |
 |--------|---------|---------|-------|
