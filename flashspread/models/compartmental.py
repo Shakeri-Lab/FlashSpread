@@ -262,6 +262,13 @@ class SEIRModel:
         # For dense hazard computation (CUDA Graph compatibility)
         self.sparse_hazard = True
 
+        # Transmission mode for non-Markovian edge engines:
+        #   "constant": infectivity[j] = beta for I-nodes (Markovian edge, default)
+        #   "age_dependent": infectivity[j] = beta * h_IR(age[j]) for I-nodes
+        # "constant" matches the original RenewalEngine semantics.
+        # "age_dependent" uses the source-node compromise for true non-Markovian edges.
+        self.transmission_mode = "constant"
+
         # Device tensors
         self._beta_t = None
         self._mu_ei = None
@@ -338,6 +345,102 @@ class SEIRModel:
 
             # Use in-place operations for CUDA Graph compatibility
             out.copy_(torch.where(s_mask, rate_s, out))
+            out.copy_(torch.where(e_mask, hazard_e, out))
+            out.copy_(torch.where(i_mask, hazard_i, out))
+
+        return out
+
+    def compute_infectivity(
+        self,
+        age: torch.Tensor,
+        state: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute per-node infectivity for non-Markovian edge transmission.
+
+        Two modes controlled by self.transmission_mode:
+          "constant":      infectivity[j] = beta for I-nodes (Markovian-equivalent)
+          "age_dependent": infectivity[j] = beta * h_IR(age[j]) (source-node compromise)
+
+        Args:
+            age: [N] tensor of holding times.
+            state: [N] tensor of current states.
+            out: Optional output tensor.
+
+        Returns:
+            [N] tensor of infectivity values.
+        """
+        if out is None:
+            out = torch.zeros_like(age)
+        else:
+            out.zero_()
+
+        i_mask = state == self.infected
+
+        if self.transmission_mode == "age_dependent":
+            # Source-node compromise: infectivity varies with infection age
+            hazard_all = lognormal_hazard_stable(
+                torch.clamp(age, min=1e-10), self._mu_ir, self._sig_ir
+            )
+            out.copy_(torch.where(i_mask, self._beta_t * hazard_all, out))
+        else:
+            # Constant beta (default): matches original RenewalEngine semantics
+            out.copy_(torch.where(i_mask, self._beta_t, out))
+
+        return out
+
+    def compute_rates_nonmarkov(
+        self,
+        age: torch.Tensor,
+        state: torch.Tensor,
+        pressure: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute transition rates for non-Markovian edge mode.
+
+        In this mode, pressure already encodes beta * h_IR via the
+        infectivity pre-pass. S->E rate = pressure directly.
+        E->I and I->R hazards are unchanged.
+
+        Args:
+            age: [N] tensor of holding times.
+            state: [N] tensor of current states.
+            pressure: [N] tensor from FlashNeighborInfectivity (already
+                      includes beta * age-dependent infectivity).
+            out: Optional output tensor.
+
+        Returns:
+            [N] tensor of hazard rates.
+        """
+        if out is None:
+            out = torch.zeros_like(age)
+        else:
+            out.zero_()
+
+        s_mask = state == self.susceptible
+        e_mask = state == self.exposed
+        i_mask = state == self.infected
+
+        if self.sparse_hazard:
+            # S: rate = pressure (already includes beta * h_IR from infectivity)
+            out[s_mask] = pressure[s_mask]
+
+            if e_mask.any():
+                out[e_mask] = lognormal_hazard_stable(
+                    age[e_mask], self._mu_ei, self._sig_ei
+                )
+            if i_mask.any():
+                out[i_mask] = lognormal_hazard_stable(
+                    age[i_mask], self._mu_ir, self._sig_ir
+                )
+        else:
+            # Dense (CUDA Graph compatible)
+            hazard_e = lognormal_hazard_stable(age, self._mu_ei, self._sig_ei)
+            hazard_i = lognormal_hazard_stable(age, self._mu_ir, self._sig_ir)
+
+            out.copy_(torch.where(s_mask, pressure, out))
             out.copy_(torch.where(e_mask, hazard_e, out))
             out.copy_(torch.where(i_mask, hazard_i, out))
 

@@ -3,7 +3,7 @@ Core components for FlashSpread: graph structures, kernels, and network utilitie
 """
 
 from .graph import GraphCSR
-from .flash_neighbor import FlashNeighbor
+from .flash_neighbor import FlashNeighbor, FlashNeighborInfectivity
 from .network import (
     FixedDegreeGraph,
     RandomGeometricGraph,
@@ -16,6 +16,7 @@ from .network import (
 __all__ = [
     "GraphCSR",
     "FlashNeighbor",
+    "FlashNeighborInfectivity",
     "FixedDegreeGraph",
     "RandomGeometricGraph",
     "BarabasiAlbertGraph",

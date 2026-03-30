@@ -16,7 +16,7 @@ import torch
 from typing import Tuple, Optional
 
 from ..core.graph import GraphCSR
-from ..core.flash_neighbor import FlashNeighbor
+from ..core.flash_neighbor import FlashNeighbor, FlashNeighborInfectivity
 
 
 class RenewalEngine:
@@ -48,6 +48,7 @@ class RenewalEngine:
         epsilon: float = 0.03,
         tau_max: float = 1.0,
         seed: int = 12345,
+        bf16_weights: bool = False,
     ):
         """
         Initialize Renewal simulation engine.
@@ -60,6 +61,8 @@ class RenewalEngine:
                     Bounds maximum transition probability per step.
             tau_max: Maximum time step (caps step size when rates are low).
             seed: Random seed.
+            bf16_weights: If True, downcast edge weights to bfloat16 to
+                         reduce memory traffic in FlashNeighbor.
         """
         self.device = torch.device(device)
         self.model = model
@@ -77,6 +80,10 @@ class RenewalEngine:
             raise ValueError("graph must have csr or row_ptr attribute")
 
         self.num_nodes = self.graph.num_nodes
+
+        # Optionally downcast weights to bf16 for reduced memory traffic
+        if bf16_weights and hasattr(self.graph, 'to_bf16_weights'):
+            self.graph = self.graph.to_bf16_weights()
 
         # Initialize FlashNeighbor kernel
         self.inducer_states = model.inducer_states
@@ -312,6 +319,149 @@ class RenewalEngineCUDAGraph(RenewalEngine):
         Returns:
             Tuple of (total_elapsed_time, current_state).
         """
+        self.step_time_accumulator.zero_()
+        self.graph_exec.replay()
+
+        elapsed = float(self.step_time_accumulator.item())
+        self.current_time += elapsed
+        self.total_steps += self.steps_per_launch
+
+        return elapsed, self.state
+
+
+class RenewalEngineNonMarkov(RenewalEngine):
+    """
+    Renewal engine with non-Markovian edge-based transmission.
+
+    Implements the source-node compromise: instead of binary inducer checks,
+    precomputes an infectivity[N] buffer encoding beta * h_IR(age[j]) for
+    infectious nodes. FlashNeighborInfectivity then accumulates weighted
+    infectivity from neighbors, enabling age-dependent transmission rates
+    at O(N) cost instead of O(E) per-edge ages.
+
+    The infectivity profile reuses the I->R lognormal hazard parameters,
+    matching the assumption that infectiousness tracks viral load.
+
+    Example:
+        >>> from flashspread import SEIRModel, FixedDegreeGraph
+        >>> from flashspread.engines.renewal import RenewalEngineNonMarkov
+        >>> graph = FixedDegreeGraph(10000, 15, device="cuda")
+        >>> model = SEIRModel(beta=0.3)
+        >>> engine = RenewalEngineNonMarkov(graph, model, device="cuda")
+        >>> engine.seed_infection(100, state=1)
+        >>> dt, state = engine.step()
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Infectivity buffer: infectivity[j] = beta * h_IR(age[j]) if I, else 0
+        self.infectivity = torch.zeros(
+            self.num_nodes, device=self.device, dtype=torch.float32
+        )
+
+        # Use infectivity-weighted kernel instead of state-based kernel
+        self.flash_neighbor_inf = FlashNeighborInfectivity(self.graph)
+
+    def _step_impl(self) -> torch.Tensor:
+        """
+        Step with non-Markovian edge transmission.
+
+        Data flow:
+        1. Infectivity pre-pass: compute infectivity[j] for all nodes
+        2. FlashNeighborInfectivity: pressure[i] = sum_j w_ji * infectivity[j]
+        3. compute_rates_nonmarkov: S rate = pressure, E/I rates = hazard(age)
+        4-6. Adaptive tau, Bernoulli, transitions (same as base class)
+        """
+        # Step 0 (NEW): Infectivity pre-pass
+        self.model.compute_infectivity(self.age, self.state, out=self.infectivity)
+
+        # Step 1: FlashNeighbor with infectivity
+        pressure = self.flash_neighbor_inf.compute_influence(self.infectivity)
+        if pressure.dim() > 1:
+            pressure = pressure.sum(dim=1)
+        self.pressure.copy_(pressure)
+
+        # Step 2: Compute rates (S rate = pressure directly)
+        self.model.compute_rates_nonmarkov(
+            self.age, self.state, self.pressure, out=self.rates
+        )
+
+        # Steps 3-6: identical to base class
+        # Step 3: Adaptive step selection
+        max_rate = self.rates.max()
+        tau_candidate = self.epsilon_t / (max_rate + 1e-12)
+        tau = torch.minimum(tau_candidate, self.tau_max_t)
+        tau = torch.where(max_rate < self.min_rate_t, self.tau_max_t, tau)
+        self.tau.copy_(tau)
+
+        # Step 4: Bernoulli probability p = 1 - exp(-rate * tau)
+        self.event_prob.copy_(self.rates)
+        self.event_prob.mul_(self.tau)
+        self.event_prob.neg_().exp_()
+        self.event_prob.neg_().add_(1.0)
+
+        # Step 5: Sample Bernoulli transitions
+        self._rand_uniform(self.rand_buffer)
+        torch.lt(self.rand_buffer, self.event_prob, out=self.event_mask)
+
+        # Step 6: Apply transitions and renewal reset
+        self.age.add_(self.tau)
+        self.model.apply_transitions(self.state, self.event_mask, out=self.next_state)
+
+        changed = self.next_state != self.state
+        self.age.masked_fill_(changed, 0.0)
+        self.state.copy_(self.next_state)
+
+        return self.tau
+
+
+class RenewalEngineNonMarkovCUDAGraph(RenewalEngineNonMarkov):
+    """
+    CUDA Graph optimized version of non-Markovian edge engine.
+
+    Captures the full step (infectivity pre-pass + FlashNeighborInfectivity
+    + rates + Bernoulli) as a CUDA Graph for reduced kernel launch overhead.
+    """
+
+    def __init__(self, *args, steps_per_launch: int = 50, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if self.device.type != "cuda":
+            raise RuntimeError("RenewalEngineNonMarkovCUDAGraph requires CUDA device")
+
+        # Disable sparse hazard mode for CUDA Graph compatibility
+        if hasattr(self.model, "sparse_hazard"):
+            self.model.sparse_hazard = False
+
+        self.steps_per_launch = int(steps_per_launch)
+        self.step_time_accumulator = torch.zeros(
+            1, device=self.device, dtype=torch.float32
+        )
+
+        self.graph_exec = None
+        self._capture_graph()
+
+    def _static_step(self) -> None:
+        """Single step for CUDA Graph capture."""
+        tau = self._step_impl()
+        self.step_time_accumulator.add_(tau)
+
+    def _capture_graph(self) -> None:
+        """Capture CUDA Graph of multiple steps."""
+        for _ in range(3):
+            self._static_step()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(self.steps_per_launch):
+                self._static_step()
+
+        self.graph_exec = g
+
+    def step(self) -> Tuple[float, torch.Tensor]:
+        """Execute steps_per_launch steps via CUDA Graph replay."""
         self.step_time_accumulator.zero_()
         self.graph_exec.replay()
 

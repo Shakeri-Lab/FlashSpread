@@ -218,6 +218,234 @@ class TestRenewalEngine:
             assert (engine.age[transitioned] < initial_ages[transitioned]).all()
 
 
+class TestBF16Weights:
+    """Test BF16 weight downcasting (Phase 1)."""
+
+    def test_bf16_influence_accuracy(self):
+        """FlashNeighbor with bf16 weights matches fp32 within tolerance."""
+        from flashspread import FlashNeighbor, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(1000, 10, device="cuda")
+        states = torch.zeros(1000, device="cuda", dtype=torch.int32)
+        states[:100] = 1  # 100 infected
+
+        # FP32 baseline
+        fn_fp32 = FlashNeighbor(graph.csr, inducer_states=[1])
+        result_fp32 = fn_fp32.compute_influence(states).clone()
+
+        # BF16 weights
+        graph_bf16 = graph.csr.to_bf16_weights()
+        fn_bf16 = FlashNeighbor(graph_bf16, inducer_states=[1])
+        result_bf16 = fn_bf16.compute_influence(states)
+
+        assert torch.allclose(result_fp32, result_bf16, atol=1e-3)
+
+    def test_renewal_engine_bf16(self):
+        """RenewalEngine with bf16_weights runs without error."""
+        from flashspread import RenewalEngine, SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(100, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = RenewalEngine(graph, model, device="cuda", bf16_weights=True)
+        engine.seed_infection(10, state=model.exposed)
+
+        for _ in range(5):
+            tau, state = engine.step()
+            assert tau > 0
+
+        counts = engine.count_by_state()
+        assert counts.sum().item() == 100
+
+
+class TestFlashNeighborInfectivity:
+    """Test infectivity-weighted kernel (Phase 2)."""
+
+    def test_infectivity_kernel_vs_reference(self):
+        """FlashNeighborInfectivity matches reference scatter_add."""
+        from flashspread.core.flash_neighbor import (
+            FlashNeighborInfectivity,
+            reference_influence_infectivity,
+        )
+        from flashspread import FixedDegreeGraph
+
+        graph = FixedDegreeGraph(500, 10, device="cuda")
+
+        # Random infectivity values
+        infectivity = torch.rand(500, device="cuda", dtype=torch.float32)
+        infectivity[100:] = 0.0  # Only first 100 are "infectious"
+
+        # Triton kernel
+        fn_inf = FlashNeighborInfectivity(graph.csr)
+        result_triton = fn_inf.compute_influence(infectivity).clone()
+
+        # Reference
+        result_ref = reference_influence_infectivity(
+            graph.edge_index, 500, infectivity,
+            weights=graph.csr.weights,
+        )
+
+        assert torch.allclose(result_triton, result_ref, atol=1e-4), \
+            f"Max diff: {(result_triton - result_ref).abs().max().item()}"
+
+    def test_seir_compute_infectivity(self):
+        """SEIRModel.compute_infectivity produces non-zero for I-nodes only."""
+        from flashspread import SEIRModel
+
+        model = SEIRModel(beta=0.3)
+        model.prepare(torch.device("cuda"))
+
+        state = torch.zeros(100, device="cuda", dtype=torch.int32)
+        state[10:30] = 2  # 20 nodes infected
+        age = torch.ones(100, device="cuda") * 3.0  # age = 3 days
+
+        infectivity = model.compute_infectivity(age, state)
+
+        # Only I-nodes should have non-zero infectivity
+        assert (infectivity[:10] == 0).all()
+        assert (infectivity[10:30] > 0).all()
+        assert (infectivity[30:] == 0).all()
+
+
+class TestRenewalEngineNonMarkov:
+    """Test non-Markovian edge engine (Phase 2)."""
+
+    def test_nonmarkov_step(self):
+        """RenewalEngineNonMarkov runs steps and conserves population."""
+        from flashspread.engines.renewal import RenewalEngineNonMarkov
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(100, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = RenewalEngineNonMarkov(graph, model, device="cuda")
+        engine.seed_infection(10, state=model.exposed)
+
+        for _ in range(10):
+            tau, state = engine.step()
+            assert tau > 0
+
+        counts = engine.count_by_state()
+        assert counts.sum().item() == 100
+
+    def test_nonmarkov_cudagraph(self):
+        """RenewalEngineNonMarkovCUDAGraph runs and conserves population."""
+        from flashspread.engines.renewal import RenewalEngineNonMarkovCUDAGraph
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(200, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = RenewalEngineNonMarkovCUDAGraph(
+            graph, model, device="cuda", steps_per_launch=10
+        )
+        engine.seed_infection(20, state=model.exposed)
+
+        elapsed, state = engine.step()
+        assert elapsed > 0
+
+        counts = engine.count_by_state()
+        assert counts.sum().item() == 200
+
+
+class TestErfcxApprox:
+    """Test erfcx rational approximation (Phase 3)."""
+
+    def test_erfcx_accuracy(self):
+        """erfcx_rational_approx matches torch.special.erfcx."""
+        from flashspread.models.hazards import erfcx_rational_approx
+
+        z = torch.linspace(-8, 40, 1000, device="cuda")
+        ref = torch.special.erfcx(z)
+        approx = erfcx_rational_approx(z)
+
+        # Relative error where ref > 1e-20
+        valid = ref > 1e-20
+        rel_err = ((approx[valid] - ref[valid]) / ref[valid]).abs()
+        # 5e-4 tolerance: the approximation uses 1-erf(z) which loses
+        # precision near the boundary; this is acceptable for tau-leaping
+        assert rel_err.max().item() < 5e-4, \
+            f"Max relative error: {rel_err.max().item()}"
+
+
+class TestRenewalEngineFused:
+    """Test fused Triton kernel engine (Phase 3)."""
+
+    def test_fused_step(self):
+        """RenewalEngineFused runs steps and conserves population."""
+        from flashspread.engines.renewal_fused import RenewalEngineFused
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(100, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = RenewalEngineFused(graph, model, device="cuda")
+        engine.seed_infection(10, state=model.exposed)
+
+        for _ in range(10):
+            tau, state = engine.step()
+            assert tau > 0
+
+        counts = engine.count_by_state()
+        assert counts.sum().item() == 100
+
+    def test_fused_cudagraph(self):
+        """RenewalEngineFusedCUDAGraph runs and conserves population."""
+        from flashspread.engines.renewal_fused import RenewalEngineFusedCUDAGraph
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(200, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = RenewalEngineFusedCUDAGraph(
+            graph, model, device="cuda", steps_per_launch=10
+        )
+        engine.seed_infection(20, state=model.exposed)
+
+        elapsed, state = engine.step()
+        assert elapsed > 0
+
+        counts = engine.count_by_state()
+        assert counts.sum().item() == 200
+
+
+class TestFactoryFunction:
+    """Test updated create_renewal_engine factory."""
+
+    def test_factory_default_is_fused_cg(self):
+        """Default factory creates FusedCUDAGraph engine."""
+        from flashspread.engines import create_renewal_engine
+        from flashspread.engines.renewal_fused import RenewalEngineFusedCUDAGraph
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(100, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = create_renewal_engine(graph, model)
+        assert isinstance(engine, RenewalEngineFusedCUDAGraph)
+
+    def test_factory_unfused_nonmarkov(self):
+        """Factory with use_fused=False creates NonMarkov engine."""
+        from flashspread.engines import create_renewal_engine
+        from flashspread.engines.renewal import RenewalEngineNonMarkovCUDAGraph
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(100, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = create_renewal_engine(
+            graph, model, use_fused=False, use_cuda_graph=True
+        )
+        assert isinstance(engine, RenewalEngineNonMarkovCUDAGraph)
+
+    def test_factory_bf16(self):
+        """Factory with bf16_weights creates engine without error."""
+        from flashspread.engines import create_renewal_engine
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(100, 10, device="cuda")
+        model = SEIRModel(beta=0.3)
+        engine = create_renewal_engine(
+            graph, model, bf16_weights=True, use_cuda_graph=False
+        )
+        engine.seed_infection(5, state=model.exposed)
+        tau, state = engine.step()
+        assert tau > 0
+
+
 class TestNetworkGeneration:
     """Test network generation utilities."""
 

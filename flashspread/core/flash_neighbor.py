@@ -59,7 +59,7 @@ if _HAS_TRITON:
             active_lane = (curr_ptr < row_end) & mask
             neighbor_id = tl.load(col_ind_ptr + curr_ptr, mask=active_lane, other=0)
             neighbor_state = tl.load(states_ptr + neighbor_id, mask=active_lane, other=-1)
-            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0)
+            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0).to(tl.float32)
 
             is_inducer = neighbor_state == inducer_state
             pressure += tl.where(is_inducer & active_lane, weight, 0.0)
@@ -104,7 +104,7 @@ if _HAS_TRITON:
         while active_any != 0:
             active_lane = (curr_ptr < row_end) & mask_node
             neighbor_id = tl.load(col_ind_ptr + curr_ptr, mask=active_lane, other=0)
-            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0)
+            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0).to(tl.float32)
             neighbor_state = tl.load(states_ptr + neighbor_id, mask=active_lane, other=-1)
 
             # Check against all inducer states
@@ -120,9 +120,53 @@ if _HAS_TRITON:
         tl.store(out_ptr + out_offsets, acc, mask=mask_node[:, None])
 
 
+    @triton.jit
+    def _flash_neighbor_infectivity_kernel(
+        infectivity_ptr,
+        row_ptr_ptr,
+        col_ind_ptr,
+        weights_ptr,
+        out_ptr,
+        N,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Infectivity-weighted kernel for non-Markovian edge transmission.
+
+        Instead of a binary state check, loads a precomputed float infectivity
+        per neighbor and accumulates weighted infectivity. This enables
+        age-dependent transmission rates via the source-node compromise.
+        """
+        pid = tl.program_id(0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+
+        row_start = tl.load(row_ptr_ptr + offsets, mask=mask, other=0)
+        row_end = tl.load(row_ptr_ptr + offsets + 1, mask=mask, other=0)
+
+        pressure = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        curr_ptr = row_start
+        active_any = tl.max(curr_ptr < row_end, axis=0)
+
+        while active_any != 0:
+            active_lane = (curr_ptr < row_end) & mask
+            neighbor_id = tl.load(col_ind_ptr + curr_ptr, mask=active_lane, other=0)
+            neighbor_inf = tl.load(infectivity_ptr + neighbor_id, mask=active_lane, other=0.0)
+            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0).to(tl.float32)
+
+            pressure += tl.where(active_lane, neighbor_inf * weight, 0.0)
+
+            curr_ptr += 1
+            active_any = tl.max(curr_ptr < row_end, axis=0)
+
+        tl.store(out_ptr + offsets, pressure, mask=mask)
+
+
 else:
     _flash_neighbor_single_kernel = None
     _flash_neighbor_multi_kernel = None
+    _flash_neighbor_infectivity_kernel = None
 
 
 def reference_influence(
@@ -275,3 +319,104 @@ class FlashNeighbor:
     def __call__(self, current_states: torch.Tensor) -> torch.Tensor:
         """Alias for compute_influence."""
         return self.compute_influence(current_states)
+
+
+class FlashNeighborInfectivity:
+    """
+    Infectivity-weighted kernel for non-Markovian edge transmission.
+
+    Instead of checking neighbor states against inducer states, this kernel
+    loads a precomputed float infectivity value per neighbor. This implements
+    the source-node compromise: infectivity[j] = beta * h(age[j]) for
+    infectious nodes, enabling age-dependent transmission without O(E)
+    per-edge age tracking.
+    """
+
+    def __init__(self, graph_csr):
+        """
+        Initialize infectivity-weighted kernel.
+
+        Args:
+            graph_csr: GraphCSR object with incoming edge structure.
+        """
+        if not _HAS_TRITON:
+            raise RuntimeError(
+                f"Triton is required for FlashNeighborInfectivity. Error: {_TRITON_IMPORT_ERROR}"
+            )
+
+        self.graph = graph_csr
+        self.N = graph_csr.num_nodes
+        self.device = graph_csr.device
+
+        if self.device.type != "cuda":
+            raise RuntimeError("FlashNeighborInfectivity requires CUDA tensors")
+
+        self.out_buffer = torch.zeros(self.N, device=self.device, dtype=torch.float32)
+
+    def compute_influence(self, infectivity: torch.Tensor) -> torch.Tensor:
+        """
+        Compute weighted influence using precomputed infectivity values.
+
+        Args:
+            infectivity: [N] float32 tensor of per-node infectivity.
+                        Non-zero for infectious nodes, zero otherwise.
+
+        Returns:
+            [N] tensor of weighted infectivity from neighbors.
+        """
+        if infectivity.dtype != torch.float32:
+            infectivity = infectivity.to(torch.float32)
+
+        BLOCK_SIZE = 128
+        grid = lambda meta: (triton.cdiv(self.N, meta["BLOCK_SIZE"]),)
+
+        _flash_neighbor_infectivity_kernel[grid](
+            infectivity_ptr=infectivity,
+            row_ptr_ptr=self.graph.row_ptr,
+            col_ind_ptr=self.graph.col_ind,
+            weights_ptr=self.graph.weights,
+            out_ptr=self.out_buffer,
+            N=self.N,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        return self.out_buffer
+
+    def __call__(self, infectivity: torch.Tensor) -> torch.Tensor:
+        """Alias for compute_influence."""
+        return self.compute_influence(infectivity)
+
+
+def reference_influence_infectivity(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    infectivity: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Reference implementation for infectivity-weighted influence.
+
+    Computes: influence[i] = sum_{j in N_in(i)} w_ji * infectivity[j]
+
+    Args:
+        edge_index: [2, E] tensor of edges (source, target).
+        num_nodes: Number of nodes.
+        infectivity: [N] tensor of per-node infectivity values.
+        weights: Optional [E] tensor of edge weights.
+
+    Returns:
+        [N] tensor of influence values.
+    """
+    device = infectivity.device
+    src = edge_index[0].to(device=device, dtype=torch.int64)
+    dst = edge_index[1].to(device=device, dtype=torch.int64)
+
+    if weights is None:
+        weights = torch.ones(src.numel(), device=device, dtype=torch.float32)
+    else:
+        weights = weights.to(device=device, dtype=torch.float32)
+
+    out = torch.zeros(num_nodes, device=device, dtype=torch.float32)
+    contributions = weights * infectivity[src]
+    out.scatter_add_(0, dst, contributions)
+    return out

@@ -83,6 +83,21 @@ class GraphCSR:
         """Return the number of edges in the graph."""
         return self.col_ind.numel()
 
+    def to_bf16_weights(self) -> "GraphCSR":
+        """Return a copy with weights downcast to bfloat16.
+
+        Halves memory traffic for the weight array during FlashNeighbor
+        traversal. Safe for epidemic simulation where weights are typically
+        small integers or unit values.
+        """
+        new_graph = object.__new__(GraphCSR)
+        new_graph.device = self.device
+        new_graph.num_nodes = self.num_nodes
+        new_graph.row_ptr = self.row_ptr
+        new_graph.col_ind = self.col_ind
+        new_graph.weights = self.weights.to(torch.bfloat16)
+        return new_graph
+
     def to(self, device: torch.device | str) -> "GraphCSR":
         """Move graph to specified device."""
         device = torch.device(device)

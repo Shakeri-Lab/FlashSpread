@@ -21,7 +21,13 @@ Performance Tips:
 """
 
 from .markovian import MarkovianEngine
-from .renewal import RenewalEngine, RenewalEngineCUDAGraph
+from .renewal import (
+    RenewalEngine,
+    RenewalEngineCUDAGraph,
+    RenewalEngineNonMarkov,
+    RenewalEngineNonMarkovCUDAGraph,
+)
+from .renewal_fused import RenewalEngineFused, RenewalEngineFusedCUDAGraph
 from .renewal_tunable import (
     RenewalEngineTunable,
     RenewalEngineTunableCUDAGraph,
@@ -49,36 +55,73 @@ def create_renewal_engine(
     model,
     device: str = "cuda",
     use_cuda_graph: bool = True,
+    nonmarkov_edges: bool = True,
+    use_fused: bool = True,
+    bf16_weights: bool = False,
+    transmission_mode: str = "constant",
     **kwargs
 ):
     """
     Factory function to create the recommended Renewal engine.
 
+    Default configuration: RenewalEngineFusedCUDAGraph (fastest).
+
     Args:
         graph: Network object with edge_index and csr attributes
         model: Non-Markovian compartmental model (e.g., SEIRModel)
         device: PyTorch device (default: "cuda")
-        use_cuda_graph: Use CUDA Graph batching for 2.8x speedup (default: True)
+        use_cuda_graph: Use CUDA Graph batching (default: True)
+        nonmarkov_edges: Use infectivity-based edge kernel (default: True)
+        use_fused: Use fused Triton kernel (default: True). Requires
+                  nonmarkov_edges=True. Falls back to unfused if False.
+        bf16_weights: Downcast edge weights to bfloat16 (default: False)
+        transmission_mode: "constant" (default, Markovian-equivalent) or
+                          "age_dependent" (source-node compromise with h_IR)
         **kwargs: Override default parameters
 
     Returns:
-        RenewalEngineCUDAGraph if use_cuda_graph=True, else RenewalEngine
+        Appropriate engine variant based on options.
     """
     params = {**RENEWAL_DEFAULTS, **kwargs}
+    engine_kwargs = dict(
+        device=device,
+        epsilon=params["epsilon"],
+        tau_max=params["tau_max"],
+        bf16_weights=bf16_weights,
+    )
 
-    if use_cuda_graph:
-        return RenewalEngineCUDAGraph(
-            graph, model, device=device,
-            epsilon=params["epsilon"],
-            tau_max=params["tau_max"],
-            steps_per_launch=params["steps_per_launch"],
-        )
+    # Set transmission mode on model before engine creation
+    if hasattr(model, 'transmission_mode'):
+        model.transmission_mode = transmission_mode
+
+    # Fused kernel requires the infectivity path (nonmarkov_edges)
+    if use_fused and nonmarkov_edges:
+        if use_cuda_graph:
+            return RenewalEngineFusedCUDAGraph(
+                graph, model,
+                steps_per_launch=params["steps_per_launch"],
+                **engine_kwargs,
+            )
+        else:
+            return RenewalEngineFused(graph, model, **engine_kwargs)
+    elif nonmarkov_edges:
+        if use_cuda_graph:
+            return RenewalEngineNonMarkovCUDAGraph(
+                graph, model,
+                steps_per_launch=params["steps_per_launch"],
+                **engine_kwargs,
+            )
+        else:
+            return RenewalEngineNonMarkov(graph, model, **engine_kwargs)
     else:
-        return RenewalEngine(
-            graph, model, device=device,
-            epsilon=params["epsilon"],
-            tau_max=params["tau_max"],
-        )
+        if use_cuda_graph:
+            return RenewalEngineCUDAGraph(
+                graph, model,
+                steps_per_launch=params["steps_per_launch"],
+                **engine_kwargs,
+            )
+        else:
+            return RenewalEngine(graph, model, **engine_kwargs)
 
 
 def create_markovian_engine(
@@ -114,6 +157,12 @@ __all__ = [
     "MarkovianEngine",
     "RenewalEngine",
     "RenewalEngineCUDAGraph",
+    # Non-Markovian edge engines
+    "RenewalEngineNonMarkov",
+    "RenewalEngineNonMarkovCUDAGraph",
+    # Fused Triton kernel engines
+    "RenewalEngineFused",
+    "RenewalEngineFusedCUDAGraph",
     # Tunable variants (for benchmarking)
     "RenewalEngineTunable",
     "RenewalEngineTunableCUDAGraph",

@@ -9,20 +9,29 @@ __version__ = "1.0.0"
 __author__ = "Heman Shakeri"
 __email__ = "hs9hd@virginia.edu"
 
-from .core import GraphCSR, FlashNeighbor, FixedDegreeGraph, RandomGeometricGraph
-from .engines import MarkovianEngine, RenewalEngine, RenewalEngineCUDAGraph
+from .core import GraphCSR, FlashNeighbor, FlashNeighborInfectivity, FixedDegreeGraph, RandomGeometricGraph
+from .engines import (
+    MarkovianEngine,
+    RenewalEngine,
+    RenewalEngineCUDAGraph,
+    RenewalEngineNonMarkov,
+    RenewalEngineNonMarkovCUDAGraph,
+)
 from .models import SISModel, SIRModel, SEIRModel
 
 __all__ = [
     # Core
     "GraphCSR",
     "FlashNeighbor",
+    "FlashNeighborInfectivity",
     "FixedDegreeGraph",
     "RandomGeometricGraph",
     # Engines
     "MarkovianEngine",
     "RenewalEngine",
     "RenewalEngineCUDAGraph",
+    "RenewalEngineNonMarkov",
+    "RenewalEngineNonMarkovCUDAGraph",
     # Models
     "SISModel",
     "SIRModel",
