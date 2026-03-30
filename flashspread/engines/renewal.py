@@ -123,11 +123,15 @@ class RenewalEngine:
             self.model.prepare(self.device)
 
     def reset(self) -> None:
-        """Reset simulation to initial state."""
+        """Reset all simulation state for clean re-use (e.g., RL episodes)."""
         self.state.zero_()
         self.age.zero_()
         self.rates.zero_()
         self.pressure.zero_()
+        self.event_prob.zero_()
+        self.event_mask.zero_()
+        self.next_state.zero_()
+        self.rand_buffer.zero_()
         self.current_time = 0.0
         self.total_steps = 0
 
@@ -140,7 +144,7 @@ class RenewalEngine:
             state: Target state (default: first non-susceptible state).
         """
         if state is None:
-            state = 1  # Typically Exposed or Infected
+            state = getattr(self.model, 'exposed', 1)
 
         indices = torch.randperm(self.num_nodes, device=self.device)[:num_infected]
         self.state[indices] = state

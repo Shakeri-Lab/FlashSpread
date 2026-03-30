@@ -36,19 +36,13 @@ class RenewalEngineFused:
     evaluation, Bernoulli sampling, and state transitions in a single
     kernel launch.
 
-    Key advantages over RenewalEngineNonMarkov:
-    - Eliminates rates, event_prob, event_mask, rand_buffer from VRAM
-    - Triton-level sparsity: skips erfcx for S/R nodes without breaking
-      CUDA Graph compatibility
-    - Single write of next_state and next_age per step
-
     Example:
         >>> from flashspread import SEIRModel, FixedDegreeGraph
         >>> from flashspread.engines.renewal_fused import RenewalEngineFused
         >>> graph = FixedDegreeGraph(10000, 15, device="cuda")
         >>> model = SEIRModel(beta=0.3)
         >>> engine = RenewalEngineFused(graph, model, device="cuda")
-        >>> engine.seed_infection(100, state=1)
+        >>> engine.seed_infection(100, state=model.exposed)
         >>> dt, state = engine.step()
     """
 
@@ -106,11 +100,10 @@ class RenewalEngineFused:
         self.epsilon_t = torch.tensor(self.epsilon, device=self.device, dtype=torch.float32)
         self.tau_max_t = torch.tensor(self.tau_max, device=self.device, dtype=torch.float32)
 
-        # RNG seed
+        # RNG: step_id increments by 1 per step, used as seed perturbation.
+        # Safe for 2^31 steps (>2 billion) without int32 overflow in kernel.
         self._rng_seed = int(seed)
-
-        # Device-side step counter for RNG offset (CUDA Graph compatible)
-        self._step_counter = torch.zeros(1, device=self.device, dtype=torch.int64)
+        self._step_id = torch.zeros(1, device=self.device, dtype=torch.int64)
 
         # Simulation state
         self.current_time = 0.0
@@ -137,17 +130,22 @@ class RenewalEngineFused:
         self._sig_ir = float(self.model._sig_ir.item())
 
     def reset(self) -> None:
-        """Reset simulation to initial state."""
+        """Reset all simulation state for clean re-use (e.g., RL episodes)."""
         self.state.zero_()
         self.age.zero_()
+        self.next_state.zero_()
+        self.next_age.zero_()
+        self.infectivity.zero_()
+        self.rates.zero_()
         self.tau.fill_(self.tau_max)
+        self._step_id.zero_()
         self.current_time = 0.0
         self.total_steps = 0
 
     def seed_infection(self, num_infected: int, state: int = None) -> None:
         """Randomly seed initial infections."""
         if state is None:
-            state = 1
+            state = self._state_e  # default: Exposed for SEIR
         indices = torch.randperm(self.num_nodes, device=self.device)[:num_infected]
         self.state[indices] = state
         self.age[indices] = 0.0
@@ -163,12 +161,12 @@ class RenewalEngineFused:
                 self.model._sig_ir,
             )
             self.infectivity.copy_(
-                torch.where(i_mask, self.model._beta_t * hazard_all, self.infectivity.zero_())
+                torch.where(i_mask, self.model._beta_t * hazard_all, 0.0)
             )
         else:
             # Constant beta: matches original RenewalEngine semantics
             self.infectivity.copy_(
-                torch.where(i_mask, self.model._beta_t, self.infectivity.zero_())
+                torch.where(i_mask, self.model._beta_t, 0.0)
             )
 
     def _compute_tau(self):
@@ -188,8 +186,8 @@ class RenewalEngineFused:
         BLOCK_SIZE = 128
         grid = lambda meta: (triton.cdiv(self.num_nodes, meta["BLOCK_SIZE"]),)
 
-        # Increment device-side step counter (CUDA Graph safe — in-place on device tensor)
-        self._step_counter.add_(self.num_nodes)
+        # Increment step_id by 1 (CUDA Graph safe, no int32 overflow risk)
+        self._step_id.add_(1)
 
         _flash_renewal_fused_kernel[grid](
             row_ptr_ptr=self.graph.row_ptr,
@@ -204,7 +202,7 @@ class RenewalEngineFused:
             sig_ir=self._sig_ir,
             tau_ptr=self.tau,
             rng_seed=self._rng_seed,
-            step_offset_ptr=self._step_counter,
+            step_id_ptr=self._step_id,
             next_state_ptr=self.next_state,
             next_age_ptr=self.next_age,
             rates_ptr=self.rates,
@@ -216,9 +214,9 @@ class RenewalEngineFused:
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        # Swap buffers
-        self.state.copy_(self.next_state)
-        self.age.copy_(self.next_age)
+        # Swap buffers (pointer swap for eager — zero overhead)
+        self.state, self.next_state = self.next_state, self.state
+        self.age, self.next_age = self.next_age, self.age
 
         # Step 3: Compute tau for next step from rates
         self._compute_tau()
@@ -256,6 +254,9 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
 
     Captures the full pipeline (infectivity pre-pass + fused Triton kernel
     + tau reduction) as a CUDA Graph for maximum throughput.
+
+    State is snapshot/restored around graph capture so that the simulation
+    starts exactly where the user expects (no "time travel" from warmup).
     """
 
     def __init__(self, *args, steps_per_launch: int = 50, **kwargs):
@@ -264,7 +265,11 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
         if self.device.type != "cuda":
             raise RuntimeError("RenewalEngineFusedCUDAGraph requires CUDA device")
 
+        # Force even steps_per_launch for double-buffer unrolling
         self.steps_per_launch = int(steps_per_launch)
+        if self.steps_per_launch % 2 != 0:
+            self.steps_per_launch += 1
+
         self.step_time_accumulator = torch.zeros(
             1, device=self.device, dtype=torch.float32
         )
@@ -272,24 +277,73 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
         self.graph_exec = None
         self._capture_graph()
 
-    def _static_step(self) -> None:
-        """Single step for CUDA Graph capture."""
+    def _static_step_forward(self) -> None:
+        """Step: state/age -> next_state/next_age (+ copy back for CG)."""
         self.step_time_accumulator.add_(self.tau)
-        self._step_impl()
+        self._infectivity_prepass()
+        self._step_id.add_(1)
+
+        BLOCK_SIZE = 128
+        grid = lambda meta: (triton.cdiv(self.num_nodes, meta["BLOCK_SIZE"]),)
+
+        _flash_renewal_fused_kernel[grid](
+            row_ptr_ptr=self.graph.row_ptr,
+            col_ind_ptr=self.graph.col_ind,
+            weights_ptr=self.graph.weights,
+            infectivity_ptr=self.infectivity,
+            age_ptr=self.age,
+            state_ptr=self.state,
+            mu_ei=self._mu_ei,
+            sig_ei=self._sig_ei,
+            mu_ir=self._mu_ir,
+            sig_ir=self._sig_ir,
+            tau_ptr=self.tau,
+            rng_seed=self._rng_seed,
+            step_id_ptr=self._step_id,
+            next_state_ptr=self.next_state,
+            next_age_ptr=self.next_age,
+            rates_ptr=self.rates,
+            N=self.num_nodes,
+            STATE_S=self._state_s,
+            STATE_E=self._state_e,
+            STATE_I=self._state_i,
+            STATE_R=self._state_r,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        # In CG mode: copy back (can't pointer-swap baked addresses)
+        self.state.copy_(self.next_state)
+        self.age.copy_(self.next_age)
+        self._compute_tau()
 
     def _capture_graph(self) -> None:
-        """Capture CUDA Graph of multiple steps."""
-        # Warmup
+        """Capture CUDA Graph with snapshot/restore to avoid state mutation."""
+        # Snapshot all mutable tensor state
+        tensor_snapshot = {}
+        for name in ['state', 'age', 'next_state', 'next_age', 'infectivity',
+                      'rates', 'tau', '_step_id', 'step_time_accumulator']:
+            tensor_snapshot[name] = getattr(self, name).clone()
+        saved_time = self.current_time
+        saved_steps = self.total_steps
+
+        # Warmup runs (required for Triton JIT + CUDA Graph)
         for _ in range(3):
-            self._static_step()
+            self._static_step_forward()
         torch.cuda.synchronize()
 
+        # Capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             for _ in range(self.steps_per_launch):
-                self._static_step()
+                self._static_step_forward()
 
         self.graph_exec = g
+
+        # Restore — simulation starts exactly where the user left it
+        for name, snap in tensor_snapshot.items():
+            getattr(self, name).copy_(snap)
+        self.current_time = saved_time
+        self.total_steps = saved_steps
 
     def step(self) -> Tuple[float, torch.Tensor]:
         """Execute steps_per_launch steps via CUDA Graph replay."""

@@ -119,7 +119,7 @@ if _HAS_TRITON:
         tau_ptr,
         # RNG
         rng_seed,
-        step_offset_ptr,
+        step_id_ptr,
         # Output (write-once)
         next_state_ptr,
         next_age_ptr,
@@ -223,8 +223,10 @@ if _HAS_TRITON:
         prob = 1.0 - tl.exp(-rate * tau)
 
         # === 5. RNG + transition ===
-        step_offset = tl.load(step_offset_ptr).to(tl.int32)
-        rand_val = tl.rand(rng_seed, idx + step_offset)
+        # Use step_id as seed perturbation, node idx as offset.
+        # step_id increments by 1 per step (safe for 2^31 steps).
+        step_id = tl.load(step_id_ptr).to(tl.int32)
+        rand_val = tl.rand(rng_seed + step_id, idx)
         event = rand_val < prob
 
         # Apply SEIR transitions: S->E, E->I, I->R
