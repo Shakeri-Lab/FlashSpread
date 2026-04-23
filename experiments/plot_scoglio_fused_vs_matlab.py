@@ -183,11 +183,7 @@ def main():
     ax.set_xlabel("Time", fontsize=12)
     ax.set_ylabel("Fraction of population", fontsize=12)
     ax.set_title(
-        f"Scoglio Validation: Fused Triton Kernel vs MATLAB Exact Gillespie\n"
-        f"N={N}, d={NLINK}, $\\beta$={BETA}, "
-        f"E$\\to$I LN({MEAN_EI},{MEDIAN_EI}), "
-        f"I$\\to$R LN({MEAN_IR},{MEDIAN_IR}), "
-        f"{NR} runs averaged",
+        f"SEIR fidelity: fused Triton vs. exact Gillespie (N={N}, {NR} runs)",
         fontsize=11,
     )
     ax.set_xlim(0, TF)

@@ -1,0 +1,21 @@
+{
+  "config_name": "renewal_batched_100",
+  "engine_type": "renewal_cuda_graph",
+  "num_nodes": 1000000,
+  "num_edges": 7500000,
+  "epsilon": 0.03,
+  "steps_per_launch": 100,
+  "sparse_hazard": true,
+  "compute_multiplier": 1,
+  "total_wall_time_s": 26.72480412805453,
+  "steps_executed": 50000,
+  "time_per_step_ms": 0.5344960825610906,
+  "steps_per_second": 1870.9211023744115,
+  "estimated_flops_per_step": 73500000,
+  "estimated_bytes_per_step": 112000004,
+  "arithmetic_intensity": 0.6562499765625008,
+  "achieved_gflops": 137.51270102451923,
+  "memory_bound_ceiling_gflops": 1338.0937022109392,
+  "compute_bound_ceiling_gflops": 19500.0,
+  "efficiency_percent": 10.276761694439356
+}

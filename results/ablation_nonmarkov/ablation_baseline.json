@@ -1,0 +1,18 @@
+{
+  "config_name": "baseline",
+  "config_id": 0,
+  "engine_type": "baseline",
+  "bf16_weights": false,
+  "steps_per_launch": 50,
+  "num_nodes": 100000,
+  "num_edges": 750000,
+  "total_wall_time_s": 0.2533079022308812,
+  "steps_executed": 200,
+  "time_per_step_ms": 1.266539511154406,
+  "steps_per_second": 789.552944217694,
+  "speedup_vs_baseline": 1.0,
+  "final_infected_mean": 1353.6,
+  "final_infected_std": 54.127996452852386,
+  "accuracy_error_percent": 0.0,
+  "accuracy_passed": true
+}

@@ -16,7 +16,7 @@ import torch
 from typing import Tuple, Optional
 
 from ..core.graph import GraphCSR
-from ..core.flash_neighbor import FlashNeighbor, FlashNeighborInfectivity
+from ..core.flash_neighbor import FlashNeighbor, FlashNeighborInfectivity, reference_influence
 
 
 class RenewalEngine:
@@ -85,9 +85,13 @@ class RenewalEngine:
         if bf16_weights and hasattr(self.graph, 'to_bf16_weights'):
             self.graph = self.graph.to_bf16_weights()
 
-        # Initialize FlashNeighbor kernel
+        # Initialize FlashNeighbor kernel (or CPU fallback)
         self.inducer_states = model.inducer_states
-        self.flash_neighbor = FlashNeighbor(self.graph, self.inducer_states)
+        self._cpu_fallback = (self.device.type != "cuda")
+        if not self._cpu_fallback:
+            self.flash_neighbor = FlashNeighbor(self.graph, self.inducer_states)
+        else:
+            self.flash_neighbor = None  # use reference_influence on CPU
 
         # State tensors
         self.state = torch.zeros(self.num_nodes, device=self.device, dtype=torch.int32)
@@ -187,7 +191,14 @@ class RenewalEngine:
         Returns tau as a tensor (not scalar) for graph capture.
         """
         # Step 1: Compute pressure (influence from infectious neighbors)
-        pressure = self.flash_neighbor.compute_influence(self.state)
+        if self._cpu_fallback:
+            pressure = reference_influence(
+                self.edge_index, self.num_nodes, self.state,
+                self.inducer_states,
+                weights=self.graph.weights,
+            )
+        else:
+            pressure = self.flash_neighbor.compute_influence(self.state)
         if pressure.dim() > 1:
             pressure = pressure.sum(dim=1)
         self.pressure.copy_(pressure)

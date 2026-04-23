@@ -1,0 +1,9 @@
+graph,kernel,nodes_per_block,nups
+FixedDegree d=8,1thread_per_node,4,8089366177.8
+FixedDegree d=8,warp_collab,2,859823811.0
+FixedDegree d=8,warp_collab,4,1366760154.6
+FixedDegree d=8,warp_collab,8,1712559973.0
+BA m=4,1thread_per_node,4,439383347.5
+BA m=4,warp_collab,2,745750480.8
+BA m=4,warp_collab,4,1165188466.9
+BA m=4,warp_collab,8,1309957129.0

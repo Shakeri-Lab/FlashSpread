@@ -351,6 +351,84 @@ sbatch slurm/run_ablation_study.sbatch
 
 ---
 
+## Reproducing the Paper
+
+Every result in the companion manuscript (`docs/jocs/FlashSpread-JOCS.tex`) is
+regenerated from this repository against the commit tagged `jocs-submission`.
+
+**Reference environment.** NVIDIA A100-SXM4-80GB (driver ≥ 535), PyTorch 2.5.1,
+Triton 3.1, CUDA 12.1, Python 3.11 (conda env pinned in `environment.yml`). The
+SLURM wrappers under [slurm/](slurm/) run each benchmark end-to-end on a
+single-GPU queue; random seeds are fixed across scripts so that the JSON and
+figure artefacts in [results/](results/) regenerate bitwise-identically.
+
+### Figure and table → script map
+
+| Artefact | Script | Wall-clock |
+|----------|--------|-----------|
+| Fig. 3 (throughput scaling), Tab. 2 (throughput decomposition) | [experiments/bench_throughput_scoglio.py](experiments/bench_throughput_scoglio.py) | ~5 min |
+| Fig. 4 (roofline), Tab. "Roofline" | [experiments/benchmark_roofline.py](experiments/benchmark_roofline.py) | ~15 min |
+| Fig. 5 (fidelity vs MATLAB exact) | [experiments/plot_scoglio_fused_vs_matlab.py](experiments/plot_scoglio_fused_vs_matlab.py) | ~10 min |
+| Tab. "ε convergence sweep" | [experiments/validate_epsilon_sweep.py](experiments/validate_epsilon_sweep.py) | ~10 min |
+| Tab. "CSR dispatch", Tab. "degree dispatch sweep" | [experiments/bench_warp_collab_ba.py](experiments/bench_warp_collab_ba.py) | ~30 min |
+| Appendix C.1 (fidelity details), Figs. 6–7 | [experiments/fidelity_sweep.py](experiments/fidelity_sweep.py) + [experiments/plot_fidelity.py](experiments/plot_fidelity.py) | ~20 min |
+| Appendix C.2 (multi-topology), Fig. 8 | [experiments/fidelity_multi_graph.py](experiments/fidelity_multi_graph.py) + [experiments/exact_gillespie_seir.py](experiments/exact_gillespie_seir.py) + [experiments/plot_fidelity_multi.py](experiments/plot_fidelity_multi.py) | ~45 min |
+| Appendix C.3 (SIS / SIR vs Doob–Gillespie), Fig. 9 | [experiments/exact_gillespie_sis_sir.py](experiments/exact_gillespie_sis_sir.py) + [experiments/validate_sis_sir_flashspread.py](experiments/validate_sis_sir_flashspread.py) + [experiments/plot_sis_sir.py](experiments/plot_sis_sir.py) | ~60 min |
+| Appendix B (erfcx approximation bounds) | `pytest tests/smoke_test.py::TestTritonErfcxAccuracy` | <10 s |
+
+### Data sources for Fig. 3 (throughput scaling)
+
+Fig. 3 is drawn from two CSVs that the scripts above produce:
+
+- GPU curves (Fused CG, unfused CG, eager) and the exact-Gillespie CPU
+  baselines (MATLAB, Python from Scoglio et al.) are in
+  [results/throughput_comparison.csv](results/throughput_comparison.csv) and
+  are measured directly in realized transitions per second (events/s).
+- CPU tau-leaping (8-core) is measured in NUPS in
+  [results/cpu_tauleaping_nups.csv](results/cpu_tauleaping_nups.csv) and
+  rendered on the events/s axis of Fig. 3 via the shared events-per-NUPS
+  ratio calibrated at *N* = 10⁶ on the Fused CG run (7.24 × 10⁻⁴ events per
+  NUPS). The ratio is valid because both CPU and GPU run the same ε = 0.03
+  tau-leaping algorithm with matched log-normal SEIR parameters; the ratio
+  reflects per-step realized-events-per-node, which is a property of the
+  algorithm, not the hardware.
+- The Fused CG 8.09 Giga-NUPS headline used in Table 2 and the abstract is
+  the 1-thread-per-node kernel row of
+  [results/warp_collab_throughput.csv](results/warp_collab_throughput.csv)
+  (NUPS measured directly as *N* × steps / wall-clock).
+- The unfused-CG NUPS row in Table 2 comes from the `renewal_batched_50`
+  entry in
+  [results/log_normal_SEIR_throughput.csv](results/log_normal_SEIR_throughput.csv)
+  (steps-per-second × *N*).
+
+### CPU tau-leaping implementation
+
+The CPU tau-leaping curve is produced by
+[experiments/bench_cpu_tauleaping.py](experiments/bench_cpu_tauleaping.py),
+which runs the **same** `RenewalEngine` class as the GPU path
+([flashspread/engines/renewal.py](flashspread/engines/renewal.py)) with
+`device="cpu"` and `torch.set_num_threads(min(cpu_count, 8))` for intra-op
+parallelism. It uses the same configuration as the GPU benchmark —
+ε = 0.03, τ_max = 0.1, β = 2/d = 0.25, log-normal E→I (mean 5, median 4)
+and I→R (mean 7.5, median 5) — and runs the same adaptive Bernoulli
+tau-leaping step (adaptive τ selection, Bernoulli sampling against
+1 − exp(−λτ), renewal age reset on transition, log-normal hazard via
+erfcx).
+
+Three GPU-specific optimizations are **not** used on CPU because they have
+no CPU analogue: the Triton `FlashNeighbor` kernel (CPU falls back to
+`reference_influence` using `torch.scatter_add`), the fused Triton step
+kernel in [flashspread/engines/renewal_fused.py](flashspread/engines/renewal_fused.py),
+and CUDA-Graph batching. The degree-aware CSR dispatch (warp/merge
+strategies) is also GPU-only. CPU parallelism comes from PyTorch's
+intra-op threading across the 8 cores on the benchmark box. The 217×
+"strict hardware" speedup reported in Table 2 is therefore strictly
+hardware-plus-implementation: same algorithm, same ε, same SEIR
+parameters, the gap is the fused Triton kernel + coalesced CSR + CUDA
+Graph on the A100 versus threaded `scatter_add` on an 8-core CPU.
+
+---
+
 ## Citation
 
 If you use FlashSpread in your research, please cite:

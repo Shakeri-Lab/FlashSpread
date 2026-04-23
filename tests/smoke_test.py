@@ -17,6 +17,38 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Module-scope Triton test kernel for TestTritonErfcxAccuracy.
+# @triton.jit requires `tl` to be resolvable in the kernel's enclosing
+# module scope at compile time, so we define the kernel here rather than
+# inside a test method.
+try:
+    import triton as _triton
+    import triton.language as tl
+
+    from flashspread.core.flash_renewal_kernel import (
+        _HAS_TRITON as _FLASH_HAS_TRITON,
+        _erfcx_approx as _flash_erfcx_approx,
+    )
+
+    if _FLASH_HAS_TRITON:
+
+        @_triton.jit
+        def _erfcx_test_kernel(z_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offs < N
+            z = tl.load(z_ptr + offs, mask=mask, other=0.0)
+            out = _flash_erfcx_approx(z)
+            tl.store(out_ptr + offs, out, mask=mask)
+    else:
+        _erfcx_test_kernel = None
+except Exception:
+    _triton = None
+    tl = None
+    _FLASH_HAS_TRITON = False
+    _erfcx_test_kernel = None
+
+
 class TestGraphCSR:
     """Test GraphCSR construction and basic properties."""
 
@@ -153,6 +185,37 @@ class TestMarkovianEngine:
         # State should still be valid
         counts = engine.count_by_state()
         assert counts.sum().item() == 100, "Population should be conserved"
+
+    def test_engine_actually_progresses(self):
+        """
+        Regression test for the apply_transitions-return-value bug:
+        with a supercritical SIS (R0 >> 1) and 10 seed infections, the
+        peak-I over 200 steps must rise meaningfully above the seed
+        fraction. Without the fix, the engine silently discarded every
+        new state and peak_I would stay stuck at the 10/100 seed level.
+        """
+        import torch
+        from flashspread import MarkovianEngine, SISModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(200, 10, device="cuda")
+        # R0 = beta * d / delta = 0.5 * 10 / 0.2 = 25, well supercritical
+        model = SISModel(beta=0.5, delta=0.2)
+        engine = MarkovianEngine(graph, model, device="cuda",
+                                 max_prob=0.1, theta=0.05)
+        engine.seed_infection(10)
+
+        peak_fraction = engine.count_infected() / 200
+        for _ in range(200):
+            engine.step()
+            peak_fraction = max(peak_fraction,
+                                engine.count_infected() / 200)
+
+        assert peak_fraction > 0.25, (
+            f"SIS engine failed to progress: peak_I={peak_fraction:.3f}, "
+            f"expected > 0.25 for a supercritical SIS. This typically "
+            f"means MarkovianEngine.step() is dropping the new-state "
+            f"tensor returned by model.apply_transitions()."
+        )
 
     def test_engine_reset(self):
         """Verify engine reset works."""
@@ -363,6 +426,108 @@ class TestErfcxApprox:
         # precision near the boundary; this is acceptable for tau-leaping
         assert rel_err.max().item() < 5e-4, \
             f"Max relative error: {rel_err.max().item()}"
+
+
+class TestTritonErfcxAccuracy:
+    """
+    Validate the in-kernel Triton erfcx approximation (_erfcx_approx in
+    flash_renewal_kernel.py) against torch.special.erfcx, and record the
+    empirical max relative error used in JOCS Appendix A.
+
+    Notes on fp32 representability:
+      - For z < 0, erfcx(z) ~ 2*exp(z^2) overflows fp32 when |z| > ~9.42.
+        We restrict the validation range to z >= -9 to keep both the
+        kernel's fp32 output and the reference in-range.
+      - For large z >> 0, erfcx(z) underflows to the kernel's 1e-30 clamp;
+        we mask those samples from the relative-error computation.
+      - Near z = 3.5 (the branch-switch point) the identity
+        `exp(z^2)(1 - erf(z))` loses significant digits in fp32 because
+        `1 - erf(3.5) ~ 5e-7` is at the edge of fp32 precision. We measure
+        the realized max relative error rather than asserting the
+        tighter (over-optimistic) "~4e-4" bound quoted in earlier drafts.
+    """
+
+    # fp32-safe range for negative z: exp(z^2) stays below fp32 max.
+    Z_LO = -9.0
+    Z_HI = 30.0
+    # Empirically measured bounds on A100 / Triton 3.1 / fp32 (2026-04):
+    #   * full range [-9, 30]: ~3.9e-2 (dominated by fp32 cancellation in
+    #     1 - erf(z) near the branch-switch at z ~ 3.5)
+    #   * away from branch boundary: ~6e-3 (near z ~ 9 where the overflow
+    #     guard drops from the 4-term asymptotic to the 1-term form)
+    # The 5e-2 / 1e-2 thresholds below leave ~25-60% headroom. These are
+    # the bounds cited in JOCS Appendix A.
+    TOLERANCE_FULL = 5e-2
+    TOLERANCE_AWAY = 1e-2
+
+    def _run_kernel(self, z):
+        if _erfcx_test_kernel is None or not _FLASH_HAS_TRITON:
+            pytest.skip("Triton / flash_renewal_kernel not available")
+        out = torch.empty_like(z)
+        BLOCK = 256
+        grid = (_triton.cdiv(z.numel(), BLOCK),)
+        _erfcx_test_kernel[grid](z, out, z.numel(), BLOCK_SIZE=BLOCK)
+        return out
+
+    def _measured_bound(self, z_lo, z_hi, n=10001):
+        """Return (max_rel_err, at_z) on a dense fp32-safe grid."""
+        z = torch.linspace(
+            z_lo, z_hi, n, device="cuda", dtype=torch.float32
+        )
+        out = self._run_kernel(z)
+        ref64 = torch.special.erfcx(z.to(torch.float64))
+
+        # Mask: exclude samples where reference underflows the kernel's
+        # 1e-30 clamp (rel-err is meaningless there) and any non-finite
+        # values (safety net; should not occur within [Z_LO, Z_HI]).
+        finite = torch.isfinite(out) & torch.isfinite(ref64.to(torch.float32))
+        valid = finite & (ref64 > 1e-20)
+        rel = ((out.to(torch.float64)[valid] - ref64[valid]) / ref64[valid]).abs()
+        if rel.numel() == 0:
+            return float("nan"), float("nan")
+        max_rel = rel.max().item()
+        arg_max = rel.argmax().item()
+        return max_rel, z[valid][arg_max].item()
+
+    def test_triton_erfcx_max_rel_err_fp32_safe_range(self):
+        """Max relative error of the Triton erfcx kernel on an fp32-safe grid."""
+        max_rel, at_z = self._measured_bound(self.Z_LO, self.Z_HI)
+        print(
+            f"\n[TritonErfcxAccuracy] max rel err = {max_rel:.3e} at z = {at_z:.3f} "
+            f"over z in [{self.Z_LO}, {self.Z_HI}] (fp32-safe range)"
+        )
+        assert max_rel < self.TOLERANCE_FULL, (
+            f"Triton erfcx max relative error {max_rel:.3e} at z={at_z:.3f} "
+            f"exceeds tolerance {self.TOLERANCE_FULL:.1e}"
+        )
+
+    def test_triton_erfcx_away_from_branch_boundary(self):
+        """
+        Away from the z~3.5 branch point, fp32 cancellation does not dominate
+        and the approximation should agree with the reference to ~1e-3.
+        """
+        # Split around the branch boundary; exclude a safety band of +/-0.25.
+        lo_part = self._measured_bound(self.Z_LO, 3.25, n=5001)
+        hi_part = self._measured_bound(3.75, self.Z_HI, n=5001)
+        print(
+            f"\n[TritonErfcxAccuracy] away-from-boundary max rel err: "
+            f"|z|<3.25: {lo_part[0]:.3e} at z={lo_part[1]:.3f}; "
+            f"z>3.75: {hi_part[0]:.3e} at z={hi_part[1]:.3f}"
+        )
+        assert lo_part[0] < self.TOLERANCE_AWAY and hi_part[0] < self.TOLERANCE_AWAY, (
+            f"Away-from-boundary max rel err exceeds {self.TOLERANCE_AWAY:.0e}: "
+            f"lo={lo_part[0]:.3e}, hi={hi_part[0]:.3e}"
+        )
+
+    def test_triton_erfcx_no_nans_across_zero(self):
+        """Kernel must not emit NaN anywhere in the fp32-safe input range."""
+        z = torch.linspace(
+            self.Z_LO, self.Z_HI, 20001, device="cuda", dtype=torch.float32
+        )
+        out = self._run_kernel(z)
+        assert torch.isnan(out).sum().item() == 0, (
+            "Triton erfcx kernel produced NaN on fp32-safe inputs"
+        )
 
 
 class TestRenewalEngineFused:

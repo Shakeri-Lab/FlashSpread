@@ -1,0 +1,219 @@
+%% FlashSpread: IO-Aware GPU Simulation of Non-Markovian Epidemic
+%% Dynamics via Kernel Fusion
+%%
+%% arXiv preprint version -- compact single-column article layout,
+%% floats anchored in place via the `float' package [H] specifier,
+%% all Elsevier cas-sc-specific blocks (CRediT, highlights, JOCS
+%% footer, ORCID author macros) removed.
+
+\documentclass[11pt]{article}
+
+% ---------- Geometry, fonts, basic layout ----------
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{parskip}           % space-between-paragraphs instead of indent
+
+% ---------- Math ----------
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+
+% ---------- Floats / tables / figures ----------
+\usepackage{float}             % [H] placement specifier
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{threeparttable}
+\usepackage{subcaption}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf,skip=6pt}
+
+% ---------- Graphics / diagrams ----------
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepgfplotslibrary{groupplots}
+\pgfplotsset{compat=1.18}
+\usepackage{pgfplotstable}
+\usepackage{standalone}
+
+% ---------- Algorithms ----------
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% ---------- Code listings ----------
+\usepackage{listings}
+\usepackage{courier}
+
+% ---------- Symbols, enumeration, hyperrefs ----------
+\usepackage{pifont}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black,
+}
+
+% ---------- Citations ----------
+\usepackage[authoryear,round]{natbib}
+\bibliographystyle{plainnat}
+
+% ---------- Theorem-like ----------
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---------- TikZ libraries ----------
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds,
+                calc, decorations.pathreplacing, patterns, shadows, chains,
+                matrix, shapes.symbols, shapes.arrows, fadings}
+
+% ---------- Colors used across figures ----------
+\definecolor{susceptible}{RGB}{31,119,180}
+\definecolor{exposed}{RGB}{255,127,14}
+\definecolor{infectious}{RGB}{44,160,44}
+\definecolor{recovered}{RGB}{214,39,40}
+\definecolor{kernelblue}{RGB}{70,130,180}
+\definecolor{kernelgreen}{RGB}{60,179,113}
+\definecolor{kernelpurple}{RGB}{138,43,226}
+\definecolor{markovblue}{RGB}{31,119,180}
+\definecolor{renewgreen}{RGB}{44,160,44}
+\definecolor{stateorange}{RGB}{230,136,28}
+\definecolor{decisionyellow}{RGB}{240,210,60}
+\definecolor{graphnode}{RGB}{31,119,180}
+\definecolor{csrcell}{RGB}{230,136,28}
+\definecolor{highlightcell}{RGB}{214,39,40}
+\definecolor{accentblue}{RGB}{70,130,180}
+\definecolor{threadblue}{RGB}{31,119,180}
+\definecolor{regblue}{RGB}{70,130,180}
+\definecolor{globalorange}{RGB}{230,136,28}
+\definecolor{l2purple}{RGB}{138,43,226}
+\definecolor{accentred}{RGB}{214,39,40}
+\definecolor{hbmorange}{RGB}{230,136,28}
+\definecolor{smgreen}{RGB}{44,160,44}
+\definecolor{choice}{RGB}{240,210,60}
+\definecolor{outcome}{RGB}{70,130,180}
+\definecolor{markov}{RGB}{31,119,180}
+\definecolor{renew}{RGB}{44,160,44}
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+% ---------- Python code listing style ----------
+\lstdefinestyle{pythonstyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{blue},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\scriptsize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    frame=single,
+    language=Python
+}
+\lstset{style=pythonstyle}
+
+% ---------- Manuscript-wide macros ----------
+\newcommand{\flashspread}{\textsc{FlashSpread}}
+\newcommand{\bigO}{\mathcal{O}}
+
+% ---------- Title block ----------
+\title{%
+  FlashSpread: IO-Aware GPU Simulation of Non-Markovian Epidemic
+  Dynamics via Kernel Fusion
+}
+
+\author{%
+  Heman Shakeri\thanks{Corresponding author:
+  \href{mailto:hs9hd@virginia.edu}{hs9hd@virginia.edu}; ORCID
+  0000-0002-9891-5748.}\,$^{,1}$
+  \and Behnaz Moradi-Jamei$^{2}$
+  \and Aram Vajdi$^{1}$
+  \and Ehsan Ardjmand$^{3}$ \\[6pt]
+  \footnotesize $^{1}$School of Data Science, University of Virginia,
+  Charlottesville, VA 22904, USA \\
+  \footnotesize $^{2}$Department of Mathematics \& Statistics,
+  James Madison University, Harrisonburg, VA 22807, USA \\
+  \footnotesize $^{3}$Ohio University, Athens, OH 45701, USA
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Non-Markovian (renewal) epidemic simulation on multi-million-node
+contact networks is essential for realistic forecasting under general
+age-dependent holding-time distributions (log-normal, Weibull, Erlang,
+and similar), but the age-dependent hazard forces dense per-step
+updates that render the sparse event-queue strategies of standard CPU
+methods ineffective. We present \flashspread{}, a GPU framework that
+consolidates the per-step renewal pipeline (CSR traversal, numerically
+stable $\mathrm{erfcx}$-based hazard evaluation, Bernoulli tau-leaping,
+state transition, and next-step infectivity write-back) into a single
+fused Triton kernel whose intermediates never leave streaming-
+multiprocessor registers, with block-scalar skips that preserve CUDA
+Graph capture and a degree-aware CSR dispatch (thread / warp /
+edge-merge) that keeps the peak throughput on scale-free graphs. On an
+NVIDIA A100 the fused CUDA-Graph engine reaches 8.09~Giga-NUPS at
+$N = 10^6$ on a uniform-degree graph, a $217\times$ strict hardware
+speedup over optimised CPU tau-leaping at the same $N$; on a
+Barab\'{a}si--Albert graph of the same size the merge-based dispatch
+recovers $4.5\times$ ($0.45 \to 2.0$ Giga-NUPS) over the default
+kernel, and the framework scales to $N = 10^8$ on a single A100
+(40~GB), with a mixed-precision storage path that extends the
+L2-reachable scale by roughly $3\times$ and delivers a $1.15\times$
+throughput lift at the far bandwidth-bound end. Validation against an
+exact non-Markovian Gillespie reference shows a structural-bias floor
+of $\sim$6\% on peak infection and $\sim$7\% on final attack rate that
+does not detectably decrease as $\varepsilon \to 0$ across two decades
+of tolerance, comfortably within typical epidemiological parameter
+uncertainty. Code: \url{https://github.com/Shakeri-Lab/FlashSpread}.
+\end{abstract}
+
+\noindent\textbf{Keywords:} Stochastic simulation \textperiodcentered\
+Non-Markovian renewal processes \textperiodcentered\ GPU computing
+\textperiodcentered\ Epidemic modeling \textperiodcentered\ Tau-leaping
+\textperiodcentered\ Complex networks \textperiodcentered\ Kernel
+fusion \textperiodcentered\ CUDA Graphs
+
+\bigskip\hrule\bigskip
+
+%% =============== BODY ================
+\input{body}
+
+\section*{Acknowledgments}
+
+Computational resources were provided by the University of Virginia
+Research Computing.
+
+%% =============== APPENDIX ================
+\appendix
+\input{appendix}
+
+%% =============== BIBLIOGRAPHY ================
+\bibliography{references}
+
+\end{document}

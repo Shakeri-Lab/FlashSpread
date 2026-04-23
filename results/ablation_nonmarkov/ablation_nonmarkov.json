@@ -1,0 +1,18 @@
+{
+  "config_name": "nonmarkov",
+  "config_id": 4,
+  "engine_type": "nonmarkov",
+  "bf16_weights": false,
+  "steps_per_launch": 50,
+  "num_nodes": 100000,
+  "num_edges": 750000,
+  "total_wall_time_s": 0.286643123999238,
+  "steps_executed": 200,
+  "time_per_step_ms": 1.43321561999619,
+  "steps_per_second": 697.7317202296877,
+  "speedup_vs_baseline": 0.8837047918566313,
+  "final_infected_mean": 693.6,
+  "final_infected_std": 19.200000000000003,
+  "accuracy_error_percent": 48.75886524822695,
+  "accuracy_passed": false
+}

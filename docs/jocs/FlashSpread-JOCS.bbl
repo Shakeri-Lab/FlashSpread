@@ -1,0 +1,397 @@
+\begin{thebibliography}{45}
+\expandafter\ifx\csname natexlab\endcsname\relax\def\natexlab#1{#1}\fi
+\providecommand{\url}[1]{\texttt{#1}}
+\providecommand{\href}[2]{#2}
+\providecommand{\path}[1]{#1}
+\providecommand{\DOIprefix}{doi:}
+\providecommand{\ArXivprefix}{arXiv:}
+\providecommand{\URLprefix}{URL: }
+\providecommand{\Pubmedprefix}{pmid:}
+\providecommand{\doi}[1]{\href{http://dx.doi.org/#1}{\path{#1}}}
+\providecommand{\Pubmed}[1]{\href{pmid:#1}{\path{#1}}}
+\providecommand{\bibinfo}[2]{#2}
+\ifx\xfnm\relax \def\xfnm[#1]{\unskip,\space#1}\fi
+%Type = Book
+\bibitem[{Anderson and May(1991)}]{anderson1991infectious}
+\bibinfo{author}{Anderson, R.M.}, \bibinfo{author}{May, R.M.},
+  \bibinfo{year}{1991}.
+\newblock \bibinfo{title}{Infectious diseases of humans: dynamics and control}.
+\newblock \bibinfo{publisher}{Oxford university press}.
+%Type = Inproceedings
+\bibitem[{Arai et~al.(2016)Arai, Shiokawa, Yamamuro, Onizuka and
+  Iwamura}]{arai2016rabbit}
+\bibinfo{author}{Arai, J.}, \bibinfo{author}{Shiokawa, H.},
+  \bibinfo{author}{Yamamuro, T.}, \bibinfo{author}{Onizuka, M.},
+  \bibinfo{author}{Iwamura, S.}, \bibinfo{year}{2016}.
+\newblock \bibinfo{title}{Rabbit order: Just-in-time parallel reordering for
+  fast graph analysis}, in: \bibinfo{booktitle}{IEEE International Parallel and
+  Distributed Processing Symposium (IPDPS)}, \bibinfo{publisher}{IEEE}. pp.
+  \bibinfo{pages}{22--31}.
+%Type = Article
+\bibitem[{Backer et~al.(2020)Backer, Klinkenberg and
+  Wallinga}]{backer2020incubation}
+\bibinfo{author}{Backer, J.A.}, \bibinfo{author}{Klinkenberg, D.},
+  \bibinfo{author}{Wallinga, J.}, \bibinfo{year}{2020}.
+\newblock \bibinfo{title}{Incubation period of 2019 novel coronavirus
+  (2019-ncov) infections among travellers from wuhan, china, 20--28 january
+  2020}.
+\newblock \bibinfo{journal}{Eurosurveillance} \bibinfo{volume}{25},
+  \bibinfo{pages}{2000062}.
+%Type = Book
+\bibitem[{Barrat et~al.(2008)Barrat, Barthelemy and
+  Vespignani}]{barrat2008dynamical}
+\bibinfo{author}{Barrat, A.}, \bibinfo{author}{Barthelemy, M.},
+  \bibinfo{author}{Vespignani, A.}, \bibinfo{year}{2008}.
+\newblock \bibinfo{title}{Dynamical processes on complex networks}.
+\newblock \bibinfo{publisher}{Cambridge University Press}.
+%Type = Inproceedings
+\bibitem[{Bisset et~al.(2009)Bisset, Chen, Feng, Kumar and
+  Marathe}]{bisset2009parallel}
+\bibinfo{author}{Bisset, K.R.}, \bibinfo{author}{Chen, J.},
+  \bibinfo{author}{Feng, X.}, \bibinfo{author}{Kumar, V.S.A.},
+  \bibinfo{author}{Marathe, M.V.}, \bibinfo{year}{2009}.
+\newblock \bibinfo{title}{Parallel algorithms for simulating interacting
+  individuals with infections on {GPU}s}, in: \bibinfo{booktitle}{International
+  Conference on Parallel Processing}, \bibinfo{organization}{IEEE}. pp.
+  \bibinfo{pages}{223--230}.
+%Type = Article
+\bibitem[{Bogu{\~n}{\'a} et~al.(2014)Bogu{\~n}{\'a}, Lafuerza, Toral and
+  Serrano}]{boguna2014simulating}
+\bibinfo{author}{Bogu{\~n}{\'a}, M.}, \bibinfo{author}{Lafuerza, L.F.},
+  \bibinfo{author}{Toral, R.}, \bibinfo{author}{Serrano, M.{\'A}.},
+  \bibinfo{year}{2014}.
+\newblock \bibinfo{title}{Simulating non-{M}arkovian stochastic processes}.
+\newblock \bibinfo{journal}{Physical Review E} \bibinfo{volume}{90},
+  \bibinfo{pages}{042108}.
+%Type = Article
+\bibitem[{Cao et~al.(2006)Cao, Gillespie and Petzold}]{cao2006efficient}
+\bibinfo{author}{Cao, Y.}, \bibinfo{author}{Gillespie, D.T.},
+  \bibinfo{author}{Petzold, L.R.}, \bibinfo{year}{2006}.
+\newblock \bibinfo{title}{Efficient step size selection for the tau-leaping
+  simulation method}.
+\newblock \bibinfo{journal}{The Journal of Chemical Physics}
+  \bibinfo{volume}{124}, \bibinfo{pages}{044109}.
+%Type = Article
+\bibitem[{Chatterjee et~al.(2005)Chatterjee, Vlachos and
+  Katsoulakis}]{chatterjee2005binomial}
+\bibinfo{author}{Chatterjee, A.}, \bibinfo{author}{Vlachos, D.G.},
+  \bibinfo{author}{Katsoulakis, M.A.}, \bibinfo{year}{2005}.
+\newblock \bibinfo{title}{Binomial distribution based $\tau$-leap accelerated
+  stochastic simulation}.
+\newblock \bibinfo{journal}{The Journal of Chemical Physics}
+  \bibinfo{volume}{122}, \bibinfo{pages}{024112}.
+%Type = Article
+\bibitem[{Cure et~al.(2025)Cure, Pflug and Pigolotti}]{cure2025fast}
+\bibinfo{author}{Cure, S.}, \bibinfo{author}{Pflug, F.G.},
+  \bibinfo{author}{Pigolotti, S.}, \bibinfo{year}{2025}.
+\newblock \bibinfo{title}{Fast and exact stochastic simulations of epidemics on
+  static and temporal networks}.
+\newblock \bibinfo{journal}{PLOS Computational Biology} \bibinfo{volume}{21},
+  \bibinfo{pages}{e1013490}.
+%Type = Article
+\bibitem[{Dao et~al.(2022)Dao, Fu, Ermon, Rudra and
+  R{\'e}}]{dao2022flashattention}
+\bibinfo{author}{Dao, T.}, \bibinfo{author}{Fu, D.}, \bibinfo{author}{Ermon,
+  S.}, \bibinfo{author}{Rudra, A.}, \bibinfo{author}{R{\'e}, C.},
+  \bibinfo{year}{2022}.
+\newblock \bibinfo{title}{Flashattention: Fast and memory-efficient exact
+  attention with io-awareness}.
+\newblock \bibinfo{journal}{Advances in neural information processing systems}
+  \bibinfo{volume}{35}, \bibinfo{pages}{16344--16359}.
+%Type = Misc
+\bibitem[{Dobson(2017)}]{dobson2017epydemic}
+\bibinfo{author}{Dobson, S.}, \bibinfo{year}{2017}.
+\newblock \bibinfo{title}{Epydemic: Epidemic simulations on networks in
+  python}.
+%Type = Article
+\bibitem[{Feng et~al.(2019)Feng, Cai, Tang and Lai}]{feng2019equivalence}
+\bibinfo{author}{Feng, M.}, \bibinfo{author}{Cai, S.M.}, \bibinfo{author}{Tang,
+  M.}, \bibinfo{author}{Lai, Y.C.}, \bibinfo{year}{2019}.
+\newblock \bibinfo{title}{Equivalence and its invalidation between
+  non-{M}arkovian and {M}arkovian spreading dynamics on complex networks}.
+\newblock \bibinfo{journal}{Nature Communications} \bibinfo{volume}{10},
+  \bibinfo{pages}{3748}.
+%Type = Article
+\bibitem[{Gillespie(1976)}]{gillespie1976general}
+\bibinfo{author}{Gillespie, D.T.}, \bibinfo{year}{1976}.
+\newblock \bibinfo{title}{A general method for numerically simulating the
+  stochastic time evolution of coupled chemical reactions}.
+\newblock \bibinfo{journal}{Journal of computational physics}
+  \bibinfo{volume}{22}, \bibinfo{pages}{403--434}.
+%Type = Article
+\bibitem[{Gillespie(1977)}]{gillespie1977exact}
+\bibinfo{author}{Gillespie, D.T.}, \bibinfo{year}{1977}.
+\newblock \bibinfo{title}{Exact stochastic simulation of coupled chemical
+  reactions}.
+\newblock \bibinfo{journal}{The Journal of Physical Chemistry}
+  \bibinfo{volume}{81}, \bibinfo{pages}{2340--2361}.
+%Type = Article
+\bibitem[{Gillespie(2001)}]{gillespie2001approximate}
+\bibinfo{author}{Gillespie, D.T.}, \bibinfo{year}{2001}.
+\newblock \bibinfo{title}{Approximate accelerated stochastic simulation of
+  chemically reacting systems}.
+\newblock \bibinfo{journal}{The Journal of Chemical Physics}
+  \bibinfo{volume}{115}, \bibinfo{pages}{1716--1733}.
+%Type = Article
+\bibitem[{He et~al.(2020)He, Lau, Wu, Deng, Wang, Hao, Lau, Wong, Guan, Tan
+  et~al.}]{he2020temporal}
+\bibinfo{author}{He, X.}, \bibinfo{author}{Lau, E.H.}, \bibinfo{author}{Wu,
+  P.}, \bibinfo{author}{Deng, X.}, \bibinfo{author}{Wang, J.},
+  \bibinfo{author}{Hao, X.}, \bibinfo{author}{Lau, Y.C.},
+  \bibinfo{author}{Wong, J.Y.}, \bibinfo{author}{Guan, Y.},
+  \bibinfo{author}{Tan, X.}, et~al., \bibinfo{year}{2020}.
+\newblock \bibinfo{title}{Temporal dynamics in viral shedding and
+  transmissibility of {COVID}-19}.
+\newblock \bibinfo{journal}{Nature Medicine} \bibinfo{volume}{26},
+  \bibinfo{pages}{672--675}.
+%Type = Article
+\bibitem[{Jenness et~al.(2018)Jenness, Goodreau and
+  Morris}]{jenness2018epimodel}
+\bibinfo{author}{Jenness, S.M.}, \bibinfo{author}{Goodreau, S.M.},
+  \bibinfo{author}{Morris, M.}, \bibinfo{year}{2018}.
+\newblock \bibinfo{title}{Epimodel: an r package for mathematical modeling of
+  infectious disease over networks}.
+\newblock \bibinfo{journal}{Journal of statistical software}
+  \bibinfo{volume}{84}, \bibinfo{pages}{1--47}.
+%Type = Article
+\bibitem[{Keeling and Eames(2005)}]{keeling2005networks}
+\bibinfo{author}{Keeling, M.J.}, \bibinfo{author}{Eames, K.T.},
+  \bibinfo{year}{2005}.
+\newblock \bibinfo{title}{Networks and epidemic models}.
+\newblock \bibinfo{journal}{Journal of the Royal Society Interface}
+  \bibinfo{volume}{2}, \bibinfo{pages}{295--307}.
+%Type = Book
+\bibitem[{Keeling and Rohani(2008)}]{keeling2008modeling}
+\bibinfo{author}{Keeling, M.J.}, \bibinfo{author}{Rohani, P.},
+  \bibinfo{year}{2008}.
+\newblock \bibinfo{title}{Modeling infectious diseases in humans and animals}.
+\newblock \bibinfo{publisher}{Princeton university press}.
+%Type = Book
+\bibitem[{Kiss et~al.(2017)Kiss, Miller and Simon}]{kiss2017mathematics}
+\bibinfo{author}{Kiss, I.Z.}, \bibinfo{author}{Miller, J.C.},
+  \bibinfo{author}{Simon, P.L.}, \bibinfo{year}{2017}.
+\newblock \bibinfo{title}{Mathematics of epidemics on networks: from exact to
+  approximate models}.
+\newblock \bibinfo{publisher}{Springer}.
+%Type = Article
+\bibitem[{Komarov and D'Souza(2012)}]{komarov2012accelerating}
+\bibinfo{author}{Komarov, I.}, \bibinfo{author}{D'Souza, R.M.},
+  \bibinfo{year}{2012}.
+\newblock \bibinfo{title}{Accelerating the {G}illespie exact stochastic
+  simulation algorithm using hybrid parallel execution on graphics processing
+  units}.
+\newblock \bibinfo{journal}{PLoS One} \bibinfo{volume}{7},
+  \bibinfo{pages}{e46693}.
+%Type = Article
+\bibitem[{Lauer et~al.(2020)Lauer, Grantz, Bi, Jones, Zheng, Meredith, Azman,
+  Reich and Lessler}]{lauer2020incubation}
+\bibinfo{author}{Lauer, S.A.}, \bibinfo{author}{Grantz, K.H.},
+  \bibinfo{author}{Bi, Q.}, \bibinfo{author}{Jones, F.K.},
+  \bibinfo{author}{Zheng, Q.}, \bibinfo{author}{Meredith, H.R.},
+  \bibinfo{author}{Azman, A.S.}, \bibinfo{author}{Reich, N.G.},
+  \bibinfo{author}{Lessler, J.}, \bibinfo{year}{2020}.
+\newblock \bibinfo{title}{The incubation period of coronavirus disease 2019
+  ({COVID}-19) from publicly reported confirmed cases: estimation and
+  application}.
+\newblock \bibinfo{journal}{Annals of Internal Medicine} \bibinfo{volume}{172},
+  \bibinfo{pages}{577--582}.
+%Type = Inproceedings
+\bibitem[{Merrill and Garland(2016)}]{merrill2016merge}
+\bibinfo{author}{Merrill, D.}, \bibinfo{author}{Garland, M.},
+  \bibinfo{year}{2016}.
+\newblock \bibinfo{title}{Merge-based parallel sparse matrix-vector
+  multiplication}, in: \bibinfo{booktitle}{Proceedings of the International
+  Conference for High Performance Computing, Networking, Storage and Analysis
+  (SC)}, \bibinfo{organization}{IEEE}. pp. \bibinfo{pages}{1--12}.
+%Type = Article
+\bibitem[{Miller and Ting(2020)}]{miller2020eon}
+\bibinfo{author}{Miller, J.C.}, \bibinfo{author}{Ting, T.},
+  \bibinfo{year}{2020}.
+\newblock \bibinfo{title}{Eon (epidemics on networks): a fast, flexible python
+  package for simulation, analytic approximation, and analysis of epidemics on
+  networks}.
+\newblock \bibinfo{journal}{arXiv preprint arXiv:2001.02436} .
+%Type = Article
+\bibitem[{Nobile et~al.(2014)Nobile, Cazzaniga, Besozzi and
+  Mauri}]{nobile2014cutauleaping}
+\bibinfo{author}{Nobile, M.S.}, \bibinfo{author}{Cazzaniga, P.},
+  \bibinfo{author}{Besozzi, D.}, \bibinfo{author}{Mauri, G.},
+  \bibinfo{year}{2014}.
+\newblock \bibinfo{title}{cu{T}au{L}eaping: A {GPU}-powered tau-leaping
+  stochastic simulator for massive parallel analyses of biological systems}.
+\newblock \bibinfo{journal}{PLoS One} \bibinfo{volume}{9},
+  \bibinfo{pages}{e91963}.
+%Type = Article
+\bibitem[{Nowzari et~al.(2016)Nowzari, Preciado and
+  Pappas}]{nowzari2016analysis}
+\bibinfo{author}{Nowzari, C.}, \bibinfo{author}{Preciado, V.M.},
+  \bibinfo{author}{Pappas, G.J.}, \bibinfo{year}{2016}.
+\newblock \bibinfo{title}{Analysis and control of epidemics: A survey of
+  spreading processes on complex networks}.
+\newblock \bibinfo{journal}{IEEE Control Systems Magazine}
+  \bibinfo{volume}{36}, \bibinfo{pages}{26--46}.
+%Type = Misc
+\bibitem[{{NVIDIA Corporation}(2019)}]{nvidia2019cugraph}
+\bibinfo{author}{{NVIDIA Corporation}}, \bibinfo{year}{2019}.
+\newblock \bibinfo{title}{{RAPIDS cuGraph}: {GPU}-accelerated graph analytics}.
+\newblock \bibinfo{howpublished}{\url{https://github.com/rapidsai/cugraph}}.
+\newblock \bibinfo{note}{Part of the RAPIDS open GPU data science suite}.
+%Type = Misc
+\bibitem[{{NVIDIA Corporation}(2024)}]{nvidia2024cudagraphs}
+\bibinfo{author}{{NVIDIA Corporation}}, \bibinfo{year}{2024}.
+\newblock \bibinfo{title}{{CUDA C++} programming guide --- section on {CUDA}
+  graphs}.
+\newblock
+  \bibinfo{howpublished}{\url{https://docs.nvidia.com/cuda/cuda-c-programming-guide/}}.
+%Type = Article
+\bibitem[{Pastor-Satorras et~al.(2015)Pastor-Satorras, Castellano, Van~Mieghem
+  and Vespignani}]{pastor2015epidemic}
+\bibinfo{author}{Pastor-Satorras, R.}, \bibinfo{author}{Castellano, C.},
+  \bibinfo{author}{Van~Mieghem, P.}, \bibinfo{author}{Vespignani, A.},
+  \bibinfo{year}{2015}.
+\newblock \bibinfo{title}{Epidemic processes in complex networks}.
+\newblock \bibinfo{journal}{Reviews of Modern Physics} \bibinfo{volume}{87},
+  \bibinfo{pages}{925--979}.
+%Type = Inproceedings
+\bibitem[{Perumalla(2006)}]{perumalla2006discrete}
+\bibinfo{author}{Perumalla, K.S.}, \bibinfo{year}{2006}.
+\newblock \bibinfo{title}{Discrete event execution alternatives on general
+  purpose graphical processing units ({GPGPUs})}, in:
+  \bibinfo{booktitle}{Proceedings of the 20th Workshop on Principles of
+  Advanced and Distributed Simulation}, \bibinfo{organization}{IEEE}. pp.
+  \bibinfo{pages}{74--81}.
+%Type = Article
+\bibitem[{Preciado et~al.(2014)Preciado, Zargham, Enyioha, Jadbabaie and
+  Pappas}]{preciado2014optimal}
+\bibinfo{author}{Preciado, V.M.}, \bibinfo{author}{Zargham, M.},
+  \bibinfo{author}{Enyioha, C.}, \bibinfo{author}{Jadbabaie, A.},
+  \bibinfo{author}{Pappas, G.J.}, \bibinfo{year}{2014}.
+\newblock \bibinfo{title}{Optimal resource allocation for network protection
+  against spreading processes}.
+\newblock \bibinfo{journal}{IEEE Transactions on Control of Network Systems}
+  \bibinfo{volume}{1}, \bibinfo{pages}{99--108}.
+%Type = Inproceedings
+\bibitem[{Rossetti et~al.(2018)Rossetti, Milli and
+  Rinzivillo}]{rossetti2018ndlib}
+\bibinfo{author}{Rossetti, G.}, \bibinfo{author}{Milli, L.},
+  \bibinfo{author}{Rinzivillo, S.}, \bibinfo{year}{2018}.
+\newblock \bibinfo{title}{Ndlib: a python library to model and analyze
+  diffusion processes over complex networks}, in: \bibinfo{booktitle}{Companion
+  Proceedings of the The Web Conference 2018}, pp. \bibinfo{pages}{183--186}.
+%Type = Article
+\bibitem[{Sahneh et~al.(2013)Sahneh, Scoglio and
+  Van~Mieghem}]{sahneh2013generalized}
+\bibinfo{author}{Sahneh, F.D.}, \bibinfo{author}{Scoglio, C.},
+  \bibinfo{author}{Van~Mieghem, P.}, \bibinfo{year}{2013}.
+\newblock \bibinfo{title}{Generalized epidemic mean-field model for spreading
+  processes over multilayer complex networks}.
+\newblock \bibinfo{journal}{IEEE/ACM Transactions on Networking}
+  \bibinfo{volume}{21}, \bibinfo{pages}{1609--1620}.
+%Type = Article
+\bibitem[{Sahneh et~al.(2017)Sahneh, Vajdi, Shakeri, Fan and
+  Scoglio}]{sahneh2017gemfsim}
+\bibinfo{author}{Sahneh, F.D.}, \bibinfo{author}{Vajdi, A.},
+  \bibinfo{author}{Shakeri, H.}, \bibinfo{author}{Fan, F.},
+  \bibinfo{author}{Scoglio, C.}, \bibinfo{year}{2017}.
+\newblock \bibinfo{title}{{GEMF}sim: A stochastic simulator for the generalized
+  epidemic modeling framework}.
+\newblock \bibinfo{journal}{Journal of Computational Science}
+  \bibinfo{volume}{22}, \bibinfo{pages}{36--44}.
+%Type = Article
+\bibitem[{Samaei et~al.(2025)Samaei, Sahneh and Scoglio}]{samaei2025fastgemf}
+\bibinfo{author}{Samaei, M.H.}, \bibinfo{author}{Sahneh, F.D.},
+  \bibinfo{author}{Scoglio, C.}, \bibinfo{year}{2025}.
+\newblock \bibinfo{title}{Fastgemf: Scalable high-speed simulation of
+  stochastic spreading processes over complex multilayer networks}.
+\newblock \bibinfo{journal}{IEEE Access} .
+%Type = Article
+\bibitem[{Sanche et~al.(2020)Sanche, Lin, Xu, Romero-Severson, Hengartner and
+  Ke}]{sanche2020high}
+\bibinfo{author}{Sanche, S.}, \bibinfo{author}{Lin, Y.T.}, \bibinfo{author}{Xu,
+  C.}, \bibinfo{author}{Romero-Severson, E.}, \bibinfo{author}{Hengartner, N.},
+  \bibinfo{author}{Ke, R.}, \bibinfo{year}{2020}.
+\newblock \bibinfo{title}{High contagiousness and rapid spread of severe acute
+  respiratory syndrome coronavirus 2}.
+\newblock \bibinfo{journal}{Emerging infectious diseases} \bibinfo{volume}{26},
+  \bibinfo{pages}{1470}.
+%Type = Article
+\bibitem[{Sherborne et~al.(2018)Sherborne, Miller, Blyuss and
+  Kiss}]{sherborne2018mean}
+\bibinfo{author}{Sherborne, N.}, \bibinfo{author}{Miller, J.C.},
+  \bibinfo{author}{Blyuss, K.B.}, \bibinfo{author}{Kiss, I.Z.},
+  \bibinfo{year}{2018}.
+\newblock \bibinfo{title}{Mean-field models for non-{M}arkovian epidemics on
+  networks}.
+\newblock \bibinfo{journal}{Journal of Mathematical Biology}
+  \bibinfo{volume}{76}, \bibinfo{pages}{755--778}.
+%Type = Article
+\bibitem[{Starnini et~al.(2017)Starnini, Gleeson and
+  Bogu{\~n}{\'a}}]{starnini2017equivalence}
+\bibinfo{author}{Starnini, M.}, \bibinfo{author}{Gleeson, J.P.},
+  \bibinfo{author}{Bogu{\~n}{\'a}, M.}, \bibinfo{year}{2017}.
+\newblock \bibinfo{title}{Equivalence between non-{M}arkovian and {M}arkovian
+  dynamics in epidemic spreading processes}.
+\newblock \bibinfo{journal}{Physical Review Letters} \bibinfo{volume}{118},
+  \bibinfo{pages}{128301}.
+%Type = Book
+\bibitem[{Vajdi(2020)}]{vajdi2020stochastic}
+\bibinfo{author}{Vajdi, A.}, \bibinfo{year}{2020}.
+\newblock \bibinfo{title}{Stochastic spreading processes on networks}.
+\newblock \bibinfo{publisher}{Kansas State University}.
+%Type = Article
+\bibitem[{Vajdi et~al.(2023)Vajdi, Cohnstaedt, Noronha, Mitzel, Wilson and
+  Scoglio}]{vajdi2023non}
+\bibinfo{author}{Vajdi, A.}, \bibinfo{author}{Cohnstaedt, L.W.},
+  \bibinfo{author}{Noronha, L.E.}, \bibinfo{author}{Mitzel, D.N.},
+  \bibinfo{author}{Wilson, W.C.}, \bibinfo{author}{Scoglio, C.M.},
+  \bibinfo{year}{2023}.
+\newblock \bibinfo{title}{A non-markovian model to assess contact tracing for
+  the containment of covid-19}.
+\newblock \bibinfo{journal}{IEEE Transactions on Network Science and
+  Engineering} \bibinfo{volume}{11}, \bibinfo{pages}{197--211}.
+%Type = Article
+\bibitem[{Van~Mieghem and van~de Bovenkamp(2013)}]{van2013non}
+\bibinfo{author}{Van~Mieghem, P.}, \bibinfo{author}{van~de Bovenkamp, R.},
+  \bibinfo{year}{2013}.
+\newblock \bibinfo{title}{Non-{M}arkovian infection spread dramatically alters
+  the susceptible-infected-susceptible epidemic threshold in networks}.
+\newblock \bibinfo{journal}{Physical Review Letters} \bibinfo{volume}{110},
+  \bibinfo{pages}{108701}.
+%Type = Inproceedings
+\bibitem[{Wang et~al.(2016)Wang, Davidson, Pan, Wu, Riffel and
+  Owens}]{wang2016gunrock}
+\bibinfo{author}{Wang, Y.}, \bibinfo{author}{Davidson, A.},
+  \bibinfo{author}{Pan, Y.}, \bibinfo{author}{Wu, Y.}, \bibinfo{author}{Riffel,
+  A.}, \bibinfo{author}{Owens, J.D.}, \bibinfo{year}{2016}.
+\newblock \bibinfo{title}{Gunrock: A high-performance graph processing library
+  on the {GPU}}, in: \bibinfo{booktitle}{Proceedings of the 21st ACM SIGPLAN
+  Symposium on Principles and Practice of Parallel Programming (PPoPP)},
+  \bibinfo{publisher}{ACM}. pp. \bibinfo{pages}{1--12}.
+%Type = Article
+\bibitem[{Watkins et~al.(2019)Watkins, Nowzari, Preciado and
+  Pappas}]{watkins2019robust}
+\bibinfo{author}{Watkins, N.J.}, \bibinfo{author}{Nowzari, C.},
+  \bibinfo{author}{Preciado, V.M.}, \bibinfo{author}{Pappas, G.J.},
+  \bibinfo{year}{2019}.
+\newblock \bibinfo{title}{Robust economic model predictive control of
+  continuous-time epidemic processes}.
+\newblock \bibinfo{journal}{IEEE Transactions on Automatic Control}
+  \bibinfo{volume}{65}, \bibinfo{pages}{1116--1131}.
+%Type = Inproceedings
+\bibitem[{Wei et~al.(2016)Wei, Yu, Lu and Lin}]{wei2016gorder}
+\bibinfo{author}{Wei, H.}, \bibinfo{author}{Yu, J.X.}, \bibinfo{author}{Lu,
+  C.}, \bibinfo{author}{Lin, X.}, \bibinfo{year}{2016}.
+\newblock \bibinfo{title}{Speedup graph processing by graph ordering}, in:
+  \bibinfo{booktitle}{Proceedings of the 2016 International Conference on
+  Management of Data (SIGMOD)}, \bibinfo{publisher}{ACM}. pp.
+  \bibinfo{pages}{1813--1828}.
+%Type = Inproceedings
+\bibitem[{Zou et~al.(2013)Zou, Lv, Deng and Ji}]{zou2013epidemic}
+\bibinfo{author}{Zou, P.}, \bibinfo{author}{Lv, Y.S.}, \bibinfo{author}{Deng,
+  X.G.}, \bibinfo{author}{Ji, H.}, \bibinfo{year}{2013}.
+\newblock \bibinfo{title}{Epidemic simulation of large-scale social contact
+  networks on {GPU} clusters}, in: \bibinfo{booktitle}{Proceedings of the 2013
+  Winter Simulation Conference}, \bibinfo{organization}{IEEE}. pp.
+  \bibinfo{pages}{1267--1278}.
+
+\end{thebibliography}

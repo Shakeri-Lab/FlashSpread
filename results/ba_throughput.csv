@@ -1,0 +1,3 @@
+engine,graph,N,m,nups
+Fused eager,BA,1000000,4,420224149.2
+Fused CG,BA,1000000,4,438631463.0

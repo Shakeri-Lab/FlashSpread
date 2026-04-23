@@ -1,0 +1,12 @@
+config_name,engine_type,num_nodes,num_edges,epsilon,steps_per_launch,sparse_hazard,compute_multiplier,time_per_step_ms,steps_per_second,achieved_gflops,arithmetic_intensity,efficiency_percent
+renewal_compute_bound,renewal_cuda_graph,1000000,7500000,0.03,50,False,20,3.4321,291.4,652.8,20.0,3.35
+renewal_ridge_16,renewal_cuda_graph,1000000,7500000,0.03,50,False,16,2.7093,369.1,664.6,16.08,3.41
+renewal_ridge_8,renewal_cuda_graph,1000000,7500000,0.03,50,False,8,1.54,649.4,597.7,8.22,3.57
+renewal_baseline,renewal,1000000,7500000,0.03,1,True,1,1.486,672.9,49.5,0.66,3.7
+renewal_small_tau,renewal,1000000,7500000,0.01,1,True,1,1.4795,675.9,49.7,0.66,3.71
+renewal_large_tau,renewal,1000000,7500000,0.1,1,True,1,1.4779,676.6,49.7,0.66,3.72
+renewal_dense,renewal,1000000,7500000,0.03,1,False,1,0.9054,1104.4,166.2,1.34,6.07
+renewal_compute_heavy,renewal_cuda_graph,1000000,7500000,0.03,50,False,2,0.688,1453.5,378.6,2.33,7.98
+renewal_batched_10,renewal_cuda_graph,1000000,7500000,0.03,10,True,1,0.5402,1851.1,136.1,0.66,10.17
+renewal_batched_50,renewal_cuda_graph,1000000,7500000,0.03,50,True,1,0.5366,1863.7,137.0,0.66,10.24
+renewal_batched_100,renewal_cuda_graph,1000000,7500000,0.03,100,True,1,0.5345,1870.9,137.5,0.66,10.28

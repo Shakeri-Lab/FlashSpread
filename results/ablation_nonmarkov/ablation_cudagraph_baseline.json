@@ -1,0 +1,18 @@
+{
+  "config_name": "cudagraph_baseline",
+  "config_id": 2,
+  "engine_type": "cudagraph",
+  "bf16_weights": false,
+  "steps_per_launch": 50,
+  "num_nodes": 100000,
+  "num_edges": 750000,
+  "total_wall_time_s": 0.04893442939501256,
+  "steps_executed": 200,
+  "time_per_step_ms": 0.2446721469750628,
+  "steps_per_second": 4087.101913165134,
+  "speedup_vs_baseline": 5.176476059138406,
+  "final_infected_mean": 1396.8,
+  "final_infected_std": 54.282225451799604,
+  "accuracy_error_percent": 3.1914893617021316,
+  "accuracy_passed": true
+}

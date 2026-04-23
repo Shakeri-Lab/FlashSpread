@@ -1,0 +1,3 @@
+graph,N,nups_constant,nups_age_dependent,rel_slowdown
+ER-proxy (FixedDegree d=8),1000000,7099338995.6,4878417000.0,0.455255
+BA (m=4),1000000,433522312.6,416263965.2,0.041460

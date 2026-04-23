@@ -1,0 +1,21 @@
+{
+  "config_name": "renewal_ridge_16",
+  "engine_type": "renewal_cuda_graph",
+  "num_nodes": 1000000,
+  "num_edges": 7500000,
+  "epsilon": 0.03,
+  "steps_per_launch": 50,
+  "sparse_hazard": false,
+  "compute_multiplier": 16,
+  "total_wall_time_s": 67.73333490989171,
+  "steps_executed": 25000,
+  "time_per_step_ms": 2.7093333963956683,
+  "steps_per_second": 369.09447959794795,
+  "estimated_flops_per_step": 1800500000,
+  "estimated_bytes_per_step": 112000004,
+  "arithmetic_intensity": 16.075892283003846,
+  "achieved_gflops": 664.5546105161052,
+  "memory_bound_ceiling_gflops": 32778.74436504484,
+  "compute_bound_ceiling_gflops": 19500.0,
+  "efficiency_percent": 3.4079723616210518
+}

@@ -1,0 +1,18 @@
+{
+  "config_name": "fused_cg",
+  "config_id": 10,
+  "engine_type": "fused_cg",
+  "bf16_weights": false,
+  "steps_per_launch": 50,
+  "num_nodes": 100000,
+  "num_edges": 750000,
+  "total_wall_time_s": 0.023681160621345045,
+  "steps_executed": 200,
+  "time_per_step_ms": 0.11840580310672522,
+  "steps_per_second": 8445.53200740211,
+  "speedup_vs_baseline": 10.696599980093957,
+  "final_infected_mean": 676.6,
+  "final_infected_std": 29.22738441941051,
+  "accuracy_error_percent": 50.014775413711575,
+  "accuracy_passed": false
+}

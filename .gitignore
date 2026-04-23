@@ -61,3 +61,26 @@ Thumbs.db
 .autopilot.json
 .cursor/
 docs/*.pdf
+
+# Claude Code local state (should not be checked in)
+.claude/
+.claude_session_summary.md
+
+# Transient LaTeX build trees (reproducible from source)
+docs/arxiv_build/
+docs/arxiv_build_compact/
+
+# LaTeX compilation by-products
+*.aux
+*.bbl
+*.blg
+*.log
+*.toc
+*.out
+*.lof
+*.lot
+*.abs
+*.synctex.gz
+# Keep pre-compiled .bbl inside the shipped arxiv zip, but not in the tree
+!docs/jocs/arxiv/FlashSpread-arxiv.bbl
+!docs/jocs/FlashSpread-JOCS.bbl

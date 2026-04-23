@@ -1,0 +1,18 @@
+{
+  "config_name": "fused_bf16",
+  "config_id": 9,
+  "engine_type": "fused",
+  "bf16_weights": true,
+  "steps_per_launch": 50,
+  "num_nodes": 100000,
+  "num_edges": 750000,
+  "total_wall_time_s": 0.07206521444022655,
+  "steps_executed": 200,
+  "time_per_step_ms": 0.3603260722011328,
+  "steps_per_second": 2775.2640653818785,
+  "speedup_vs_baseline": 3.514981592693154,
+  "final_infected_mean": 704.2,
+  "final_infected_std": 18.312837027615355,
+  "accuracy_error_percent": 47.975768321512994,
+  "accuracy_passed": false
+}

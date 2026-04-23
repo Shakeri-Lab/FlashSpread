@@ -1,0 +1,21 @@
+{
+  "config_name": "renewal_dense",
+  "engine_type": "renewal",
+  "num_nodes": 1000000,
+  "num_edges": 7500000,
+  "epsilon": 0.03,
+  "steps_per_launch": 1,
+  "sparse_hazard": false,
+  "compute_multiplier": 1,
+  "total_wall_time_s": 0.4527246879879385,
+  "steps_executed": 500,
+  "time_per_step_ms": 0.905449375975877,
+  "steps_per_second": 1104.4239761303254,
+  "estimated_flops_per_step": 150500000,
+  "estimated_bytes_per_step": 112000004,
+  "arithmetic_intensity": 1.3437499520089302,
+  "achieved_gflops": 166.21580840761396,
+  "memory_bound_ceiling_gflops": 2739.9061521462086,
+  "compute_bound_ceiling_gflops": 19500.0,
+  "efficiency_percent": 6.066478163035427
+}

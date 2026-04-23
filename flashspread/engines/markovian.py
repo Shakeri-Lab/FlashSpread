@@ -157,6 +157,11 @@ class MarkovianEngine:
         # Compute adaptive time step
         total_rate = self.rates.sum().item()
         if total_rate < 1e-12:
+            # No active reactions (absorbing state, e.g. all-R in SIR).
+            # Still advance simulated time so external `while current_time
+            # < tf` loops terminate; otherwise the engine silently hangs
+            # after absorption.
+            self.current_time += self.tau_max
             return self.tau_max, 0
 
         # Tau selection: bound expected events and max probability
@@ -175,9 +180,14 @@ class MarkovianEngine:
 
         num_events = event_mask.sum().item()
         if num_events > 0:
-            # Apply transitions
+            # Apply transitions: the model returns a fresh tensor when
+            # out= is not passed, so we need to explicitly write back to
+            # self.state. (Previously this return value was dropped, so
+            # the engine silently made no progress on any compartmental
+            # model; this is the fix.)
             old_state = self.state.clone()
-            self.model.apply_transitions(self.state, event_mask)
+            new_state = self.model.apply_transitions(self.state, event_mask)
+            self.state.copy_(new_state)
 
             # Sparse update of influence and rates
             self._sparse_update(event_mask, old_state)

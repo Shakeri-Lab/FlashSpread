@@ -1,0 +1,21 @@
+{
+  "config_name": "markov_baseline",
+  "engine_type": "markovian",
+  "num_nodes": 1000000,
+  "num_edges": 7500000,
+  "epsilon": 0.1,
+  "steps_per_launch": 1,
+  "sparse_hazard": true,
+  "compute_multiplier": 1,
+  "total_wall_time_s": 0.3935194530058652,
+  "steps_executed": 500,
+  "time_per_step_ms": 0.7870389060117304,
+  "steps_per_second": 1270.585218038885,
+  "estimated_flops_per_step": 37500000,
+  "estimated_bytes_per_step": 80000004,
+  "arithmetic_intensity": 0.46874997656250117,
+  "achieved_gflops": 47.64694567645818,
+  "memory_bound_ceiling_gflops": 955.7812022109399,
+  "compute_bound_ceiling_gflops": 19500.0,
+  "efficiency_percent": 4.985131070399787
+}

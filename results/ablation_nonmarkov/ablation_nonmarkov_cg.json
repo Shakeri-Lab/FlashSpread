@@ -1,0 +1,18 @@
+{
+  "config_name": "nonmarkov_cg",
+  "config_id": 6,
+  "engine_type": "nonmarkov_cg",
+  "bf16_weights": false,
+  "steps_per_launch": 50,
+  "num_nodes": 100000,
+  "num_edges": 750000,
+  "total_wall_time_s": 0.057171056605875493,
+  "steps_executed": 200,
+  "time_per_step_ms": 0.28585528302937746,
+  "steps_per_second": 3498.273634835112,
+  "speedup_vs_baseline": 4.43070177934841,
+  "final_infected_mean": 701.8,
+  "final_infected_std": 19.701776569639602,
+  "accuracy_error_percent": 48.15307328605201,
+  "accuracy_passed": false
+}

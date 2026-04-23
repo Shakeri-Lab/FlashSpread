@@ -1,0 +1,21 @@
+{
+  "config_name": "renewal_large_tau",
+  "engine_type": "renewal",
+  "num_nodes": 1000000,
+  "num_edges": 7500000,
+  "epsilon": 0.1,
+  "steps_per_launch": 1,
+  "sparse_hazard": true,
+  "compute_multiplier": 1,
+  "total_wall_time_s": 0.7389488429762423,
+  "steps_executed": 500,
+  "time_per_step_ms": 1.4778976859524846,
+  "steps_per_second": 676.6368264224691,
+  "estimated_flops_per_step": 73500000,
+  "estimated_bytes_per_step": 112000004,
+  "arithmetic_intensity": 0.6562499765625008,
+  "achieved_gflops": 49.73280674205147,
+  "memory_bound_ceiling_gflops": 1338.0937022109392,
+  "compute_bound_ceiling_gflops": 19500.0,
+  "efficiency_percent": 3.7166908909202467
+}

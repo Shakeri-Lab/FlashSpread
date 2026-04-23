@@ -126,7 +126,8 @@ def reorder_graph_rcm(graph_csr) -> Tuple[any, torch.Tensor]:
     reordered.col_ind = new_col_ind
     reordered.weights = new_weights
     reordered.num_nodes = graph_csr.num_nodes
-    reordered.num_edges = graph_csr.num_edges
+    # num_edges is a read-only property on GraphCSR (derived from
+    # col_ind.numel()); copying the backing arrays is sufficient.
     reordered.device = graph_csr.device
 
     return reordered, perm
