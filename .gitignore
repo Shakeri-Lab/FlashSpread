@@ -84,3 +84,6 @@ docs/arxiv_build_compact/
 # Keep pre-compiled .bbl inside the shipped arxiv zip, but not in the tree
 !docs/jocs/arxiv/FlashSpread-arxiv.bbl
 !docs/jocs/FlashSpread-JOCS.bbl
+
+# Local-only docs (manuscript, arxiv build, submission zip)
+docs/
