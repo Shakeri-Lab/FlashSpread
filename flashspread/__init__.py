@@ -18,8 +18,13 @@ from .engines import (
     RenewalEngineNonMarkovCUDAGraph,
 )
 from .models import SISModel, SIRModel, SEIRModel
+from .utils import check_env, resolve_device, seed_everything
 
 __all__ = [
+    # Environment / utilities
+    "check_env",
+    "resolve_device",
+    "seed_everything",
     # Core
     "GraphCSR",
     "FlashNeighbor",

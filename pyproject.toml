@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashspread"
-version = "1.0.0"
+dynamic = ["version"]
 description = "FlashSpread: GPU-accelerated Markovian and Non-Markovian Spreading Processes on Complex Networks"
 readme = "README.md"
 license = {text = "MIT"}
@@ -19,7 +19,7 @@ keywords = [
     "Markovian",
     "non-Markovian",
     "renewal processes",
-    "tau-leaping"
+    "tau-leaping",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -28,26 +28,49 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 requires-python = ">=3.10"
+
+# Base install is CPU-importable: only torch + numpy are required to
+# `import flashspread`. The GPU kernels (triton) and the NetworkX/SciPy
+# graph utilities are optional extras so that `pip install flashspread`
+# succeeds on macOS/Windows/CPU-only CI and documentation runners.
 dependencies = [
     "torch>=2.0",
-    "triton>=2.1",
-    "networkx>=3.0",
     "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-]
+gpu = ["triton>=2.1"]
+graph = ["networkx>=3.0", "scipy>=1.10"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+docs = ["mkdocs-material", "mkdocstrings[python]"]
+all = ["flashspread[gpu,graph,dev,docs]"]
 
 [project.urls]
 Homepage = "https://github.com/Shakeri-Lab/FlashSpread"
 Repository = "https://github.com/Shakeri-Lab/FlashSpread.git"
 
+[tool.setuptools.dynamic]
+version = {attr = "flashspread.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flashspread*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: marks tests that require a CUDA device (deselect with -m 'not gpu')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Conservative default: pyflakes (F) + a subset of pycodestyle (E).
+select = ["E", "F"]
+ignore = ["E501"]  # line length is handled by the formatter, not enforced hard

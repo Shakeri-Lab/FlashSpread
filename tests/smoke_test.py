@@ -10,11 +10,11 @@ import pytest
 import torch
 
 
-# Skip all tests if CUDA not available
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA not available"
-)
+# Every test in this module drives the CUDA/Triton kernels, so tag the whole
+# module `gpu`. On a CPU runner conftest.py skips gpu-marked tests (and
+# `pytest -m "not gpu"` deselects them), instead of the old module-level
+# skipif that made the *entire* suite report green with 0 tests collected.
+pytestmark = pytest.mark.gpu
 
 
 # Module-scope Triton test kernel for TestTritonErfcxAccuracy.

@@ -19,8 +19,14 @@ from typing import Tuple
 
 try:
     import triton
-except Exception:
+
+    _TRITON_IMPORT_ERROR = None
+except Exception as _exc:  # noqa: BLE001 - keep import working without a GPU
+    # Do not let a missing/broken Triton break `import flashspread`; capture
+    # the real error so it can be surfaced (chained) if the user actually
+    # constructs a GPU engine, instead of a vague "Triton is required".
     triton = None
+    _TRITON_IMPORT_ERROR = _exc
 
 from ..core.graph import GraphCSR
 from ..core.flash_renewal_kernel import (
@@ -96,7 +102,10 @@ class RenewalEngineFused:
         warp_collaborative: bool = False,
     ):
         if triton is None:
-            raise RuntimeError("Triton is required for RenewalEngineFused")
+            raise RuntimeError(
+                "Triton is required for RenewalEngineFused. Install the GPU "
+                "extra with `pip install flashspread[gpu]` on a CUDA machine."
+            ) from _TRITON_IMPORT_ERROR
 
         self.device = torch.device(device)
         self.model = model

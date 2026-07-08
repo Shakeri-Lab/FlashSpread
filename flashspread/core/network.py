@@ -6,14 +6,30 @@ topologies and loading/saving edge lists.
 """
 
 import torch
-import networkx as nx
-import numpy as np
 from typing import Tuple
 
 from .graph import GraphCSR
 
 
-def _edge_index_from_networkx(graph: nx.Graph, directed: bool = True) -> torch.Tensor:
+def _require_networkx():
+    """Import NetworkX lazily with an actionable error.
+
+    NetworkX is only needed by the graph *generators*, not to import the
+    package or run the engines, so it is an optional dependency (the
+    ``graph`` extra). Importing it here keeps ``import flashspread`` working
+    on a bare (CPU / no-GPU) install.
+    """
+    try:
+        import networkx as nx
+    except ImportError as exc:  # pragma: no cover - trivial guard
+        raise ImportError(
+            "The graph generators require NetworkX. Install it with "
+            "`pip install flashspread[graph]` (or `pip install networkx`)."
+        ) from exc
+    return nx
+
+
+def _edge_index_from_networkx(graph, directed: bool = True) -> torch.Tensor:
     """Convert NetworkX graph to edge_index tensor."""
     edges = list(graph.edges())
     if not directed and not graph.is_directed():
@@ -63,6 +79,7 @@ class FixedDegreeGraph:
         self.symmetric = bool(symmetric)
 
         # Create random regular graph
+        nx = _require_networkx()
         self._nx_graph = nx.random_regular_graph(degree, num_nodes, seed=seed)
         self._edge_index = _edge_index_from_networkx(
             self._nx_graph, directed=not self.symmetric
@@ -120,6 +137,7 @@ class RandomGeometricGraph:
         self.device = torch.device(device)
         self.symmetric = bool(symmetric)
 
+        nx = _require_networkx()
         self._nx_graph = nx.random_geometric_graph(num_nodes, radius, seed=seed)
         self._edge_index = _edge_index_from_networkx(
             self._nx_graph, directed=not self.symmetric
@@ -172,6 +190,7 @@ class BarabasiAlbertGraph:
         self.device = torch.device(device)
         self.symmetric = bool(symmetric)
 
+        nx = _require_networkx()
         self._nx_graph = nx.barabasi_albert_graph(num_nodes, num_attachments, seed=seed)
         self._edge_index = _edge_index_from_networkx(
             self._nx_graph, directed=not self.symmetric
@@ -226,6 +245,7 @@ class WattsStrogatzGraph:
         self.device = torch.device(device)
         self.symmetric = bool(symmetric)
 
+        nx = _require_networkx()
         self._nx_graph = nx.watts_strogatz_graph(num_nodes, k, p, seed=seed)
         self._edge_index = _edge_index_from_networkx(
             self._nx_graph, directed=not self.symmetric

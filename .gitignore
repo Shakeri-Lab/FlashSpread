@@ -50,6 +50,15 @@ logs/
 outputs/
 *.log
 
+# Large regenerable benchmark artifacts (figures + arrays). The small
+# CSV/JSON summaries under results/ stay tracked for provenance; regenerate
+# these via experiments/*.py + slurm/.
+results/**/*.npz
+results/**/*.npy
+results/**/*.png
+results/**/*.pdf
+results/**/*.pt
+
 # OS
 .DS_Store
 Thumbs.db
