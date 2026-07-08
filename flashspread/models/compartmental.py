@@ -250,6 +250,26 @@ class SEIRModel:
         self.mean_ir = float(mean_ir)
         self.median_ir = float(median_ir)
 
+        # A log-normal dwell time requires mean > median > 0. Otherwise
+        # sigma = sqrt(2*ln(mean/median)) becomes NaN (mean < median) or
+        # 0 (mean == median -> division by zero -> inf hazard), silently
+        # poisoning every downstream rate. Fail loudly at construction --
+        # a common trigger is accidentally swapping the mean/median args.
+        for name, mean, median in (
+            ("E->I (incubation)", self.mean_ei, self.median_ei),
+            ("I->R (infectious)", self.mean_ir, self.median_ir),
+        ):
+            if not (median > 0.0):
+                raise ValueError(
+                    f"SEIRModel {name}: median must be > 0, got median={median}."
+                )
+            if not (mean > median):
+                raise ValueError(
+                    f"SEIRModel {name}: require mean > median > 0 for a valid "
+                    f"log-normal dwell time, got mean={mean}, median={median}. "
+                    f"(Did you swap the mean and median arguments?)"
+                )
+
         self.susceptible = 0
         self.exposed = 1
         self.infected = 2

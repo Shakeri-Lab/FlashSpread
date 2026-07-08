@@ -104,19 +104,28 @@ class MarkovianEngine:
         # Simulation state
         self.current_time = 0.0
         self.total_events = 0
+        self._seed = int(seed)
         self._rng = torch.Generator(device=self.device)
-        self._rng.manual_seed(seed)
+        self._rng.manual_seed(self._seed)
 
         # Precompute model parameters on device
         self.model.prepare(self.device)
 
-    def reset(self) -> None:
-        """Reset simulation to initial state."""
+    def reset(self, episode: int | None = None) -> None:
+        """Reset simulation to initial state.
+
+        Args:
+            episode: If given, reseed with ``base_seed + episode`` so
+                successive RL episodes draw independent randomness;
+                otherwise reset to the base seed (reproduces the first run).
+        """
         self.state.zero_()
         self.rates.zero_()
         self.influence.zero_()
         self.current_time = 0.0
         self.total_events = 0
+        eff_seed = self._seed + (int(episode) if episode is not None else 0)
+        self._rng.manual_seed(eff_seed)
 
     def seed_infection(self, num_infected: int, state: int = None) -> None:
         """
@@ -127,9 +136,18 @@ class MarkovianEngine:
             state: Target state (default: model's infectious state).
         """
         if state is None:
-            state = self.model.infectious if hasattr(self.model, "infectious") else 1
+            # Models expose the inducer state as `infected` (SIS/SIR/SEIR);
+            # `infectious` was a stale name that silently fell back to 1.
+            state = getattr(self.model, "infected", 1)
 
-        indices = torch.randperm(self.num_nodes, device=self.device)[:num_infected]
+        if not (0 <= num_infected <= self.num_nodes):
+            raise ValueError(
+                f"num_infected must be in [0, {self.num_nodes}], got {num_infected}"
+            )
+
+        indices = torch.randperm(
+            self.num_nodes, device=self.device, generator=self._rng
+        )[:num_infected]
         self.state[indices] = state
 
         # Recompute influence and rates

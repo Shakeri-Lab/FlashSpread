@@ -103,6 +103,13 @@ class RenewalEngineFused:
         self.epsilon = float(epsilon)
         self.tau_max = float(tau_max)
 
+        # Validate step-control parameters (epsilon<=0 -> tau collapses to
+        # 0 and the simulation clock freezes).
+        if not (self.epsilon > 0.0):
+            raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
+        if not (self.tau_max > 0.0):
+            raise ValueError(f"tau_max must be > 0, got {self.tau_max}")
+
         # CSR-traversal strategy controls how the kernel iterates the
         # incoming-edge list:
         #   "thread": 1 thread per node, scalar loop over neighbors.
@@ -242,8 +249,13 @@ class RenewalEngineFused:
 
         # RNG: step_id increments by 1 per step, used as seed perturbation.
         # Safe for 2^31 steps (>2 billion) without int32 overflow in kernel.
+        self._base_seed = int(seed)
         self._rng_seed = int(seed)
         self._step_id = torch.zeros(1, device=self.device, dtype=torch.int64)
+
+        # Dedicated generator for reproducible initial-condition sampling.
+        self._init_gen = torch.Generator(device=self.device)
+        self._init_gen.manual_seed(self._base_seed)
 
         # Simulation state
         self.current_time = 0.0
@@ -277,8 +289,20 @@ class RenewalEngineFused:
         self._mu_ir = float(self.model._mu_ir.item())
         self._sig_ir = float(self.model._sig_ir.item())
 
-    def reset(self) -> None:
-        """Reset all simulation state for clean re-use (e.g., RL episodes)."""
+    def reset(self, episode: int | None = None) -> None:
+        """Reset all simulation state for clean re-use (e.g., RL episodes).
+
+        Args:
+            episode: If given, shift the effective RNG seed by ``episode``
+                so successive episodes are statistically independent.
+                Otherwise reset to the base seed (reproduces the first run).
+
+        Note:
+            For the CUDA-Graph subclass the per-step seed is baked into the
+            captured graph, so changing ``episode`` only affects the
+            initial-condition draw, not the in-graph step RNG. Reconstruct
+            the engine if you need a fresh in-graph stream per episode.
+        """
         self.state.zero_()
         self.age.zero_()
         self.next_state.zero_()
@@ -293,11 +317,21 @@ class RenewalEngineFused:
         self.current_time = 0.0
         self.total_steps = 0
 
+        eff_seed = self._base_seed + (int(episode) if episode is not None else 0)
+        self._rng_seed = eff_seed
+        self._init_gen.manual_seed(eff_seed)
+
     def seed_infection(self, num_infected: int, state: int = None) -> None:
         """Randomly seed initial infections."""
         if state is None:
             state = self._state_e  # default: Exposed for SEIR
-        indices = torch.randperm(self.num_nodes, device=self.device)[:num_infected]
+        if not (0 <= num_infected <= self.num_nodes):
+            raise ValueError(
+                f"num_infected must be in [0, {self.num_nodes}], got {num_infected}"
+            )
+        indices = torch.randperm(
+            self.num_nodes, device=self.device, generator=self._init_gen
+        )[:num_infected]
         self.state[indices] = state
         self.age[indices] = 0.0
         # Bootstrap infectivity from the seeded state so the first kernel

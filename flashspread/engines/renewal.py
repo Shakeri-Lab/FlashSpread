@@ -68,6 +68,15 @@ class RenewalEngine:
         self.model = model
         self.epsilon = float(epsilon)
         self.tau_max = float(tau_max)
+        self._seed = int(seed)
+
+        # Validate step-control parameters. epsilon <= 0 makes the adaptive
+        # tau collapse to 0, freezing current_time so any `while
+        # current_time < tf` loop hangs silently.
+        if not (self.epsilon > 0.0):
+            raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
+        if not (self.tau_max > 0.0):
+            raise ValueError(f"tau_max must be > 0, got {self.tau_max}")
 
         # Get graph data
         if hasattr(graph, "csr"):
@@ -118,6 +127,12 @@ class RenewalEngine:
         )
         self.inv_uint32 = torch.tensor(1.0 / (2.0**32), device=self.device, dtype=torch.float32)
 
+        # Dedicated generator for initial-condition sampling so that
+        # seed_infection() is reproducible from the engine seed alone,
+        # independent of the global torch RNG.
+        self._init_gen = torch.Generator(device=self.device)
+        self._init_gen.manual_seed(self._seed)
+
         # Simulation state
         self.current_time = 0.0
         self.total_steps = 0
@@ -126,8 +141,15 @@ class RenewalEngine:
         if hasattr(self.model, "prepare"):
             self.model.prepare(self.device)
 
-    def reset(self) -> None:
-        """Reset all simulation state for clean re-use (e.g., RL episodes)."""
+    def reset(self, episode: int | None = None) -> None:
+        """Reset all simulation state for clean re-use (e.g., RL episodes).
+
+        Args:
+            episode: If given, reseed the RNG streams with ``base_seed +
+                episode`` so successive episodes draw *independent* (not
+                identical) randomness. If None, reseed back to the base
+                seed so the reset run reproduces the first run exactly.
+        """
         self.state.zero_()
         self.age.zero_()
         self.rates.zero_()
@@ -138,6 +160,16 @@ class RenewalEngine:
         self.rand_buffer.zero_()
         self.current_time = 0.0
         self.total_steps = 0
+
+        # Reseed both RNG streams; without this, RL episodes replay an
+        # identical random stream (the step RNG counter and the initial
+        # infection draw would otherwise be frozen from construction).
+        eff_seed = self._seed + (int(episode) if episode is not None else 0)
+        self.seed_counter.copy_(
+            torch.arange(self.num_nodes, device=self.device, dtype=torch.int64)
+            + eff_seed * 1000003
+        )
+        self._init_gen.manual_seed(eff_seed)
 
     def seed_infection(self, num_infected: int, state: int = None) -> None:
         """
@@ -150,7 +182,14 @@ class RenewalEngine:
         if state is None:
             state = getattr(self.model, 'exposed', 1)
 
-        indices = torch.randperm(self.num_nodes, device=self.device)[:num_infected]
+        if not (0 <= num_infected <= self.num_nodes):
+            raise ValueError(
+                f"num_infected must be in [0, {self.num_nodes}], got {num_infected}"
+            )
+
+        indices = torch.randperm(
+            self.num_nodes, device=self.device, generator=self._init_gen
+        )[:num_infected]
         self.state[indices] = state
         self.age[indices] = 0.0  # Fresh entry into state
 
@@ -268,6 +307,50 @@ class RenewalEngine:
             count += (self.state == state_idx).sum().item()
         return count
 
+    # Default set of mutable tensors that a CUDA-Graph capture perturbs and
+    # must be restored afterwards so the simulation starts exactly where the
+    # user left it (no warmup/capture "time travel", and the RNG stream stays
+    # aligned with the eager engine at the same seed).
+    _CG_SNAPSHOT_NAMES = (
+        "state", "age", "rates", "pressure", "event_prob", "event_mask",
+        "next_state", "rand_buffer", "tau", "seed_counter",
+        "step_time_accumulator",
+    )
+
+    def _capture_multistep_graph(self, snapshot_names=None) -> None:
+        """Capture ``steps_per_launch`` steps as a CUDA Graph with
+        snapshot/restore around warmup+capture.
+
+        Subclasses must define ``_static_step()`` and ``steps_per_launch``.
+        Restoring the snapshot keeps the eager and CUDA-Graph engines
+        bit-identical at the same seed (see bug C3).
+        """
+        names = self._CG_SNAPSHOT_NAMES if snapshot_names is None else snapshot_names
+        snapshot = {
+            name: getattr(self, name).clone()
+            for name in names
+            if hasattr(self, name)
+        }
+        saved_time = self.current_time
+        saved_steps = self.total_steps
+
+        # Warmup (required for Triton JIT + CUDA Graph), then capture.
+        for _ in range(3):
+            self._static_step()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(self.steps_per_launch):
+                self._static_step()
+        self.graph_exec = g
+
+        # Restore — undo the warmup+capture mutations.
+        for name, tensor in snapshot.items():
+            getattr(self, name).copy_(tensor)
+        self.current_time = saved_time
+        self.total_steps = saved_steps
+
 
 class RenewalEngineCUDAGraph(RenewalEngine):
     """
@@ -313,19 +396,8 @@ class RenewalEngineCUDAGraph(RenewalEngine):
         self.step_time_accumulator.add_(tau)
 
     def _capture_graph(self) -> None:
-        """Capture CUDA Graph of multiple steps."""
-        # Warmup runs
-        for _ in range(3):
-            self._static_step()
-        torch.cuda.synchronize()
-
-        # Capture graph
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(self.steps_per_launch):
-                self._static_step()
-
-        self.graph_exec = g
+        """Capture CUDA Graph of multiple steps (with snapshot/restore)."""
+        self._capture_multistep_graph()
 
     def step(self) -> Tuple[float, torch.Tensor]:
         """
@@ -463,17 +535,8 @@ class RenewalEngineNonMarkovCUDAGraph(RenewalEngineNonMarkov):
         self.step_time_accumulator.add_(tau)
 
     def _capture_graph(self) -> None:
-        """Capture CUDA Graph of multiple steps."""
-        for _ in range(3):
-            self._static_step()
-        torch.cuda.synchronize()
-
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(self.steps_per_launch):
-                self._static_step()
-
-        self.graph_exec = g
+        """Capture CUDA Graph of multiple steps (with snapshot/restore)."""
+        self._capture_multistep_graph()
 
     def step(self) -> Tuple[float, torch.Tensor]:
         """Execute steps_per_launch steps via CUDA Graph replay."""

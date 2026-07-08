@@ -48,6 +48,20 @@ class GraphCSR:
         self.device = edge_index.device
         self.num_nodes = int(num_nodes)
 
+        # Bounds-check node ids. Without this an out-of-range *source*
+        # silently corrupts col_ind (later an OOB gather in the kernel ->
+        # illegal memory access) and an out-of-range *target* makes the
+        # bincount/cumsum below raise a cryptic shape error. One-time
+        # construction cost; not on any hot path.
+        if edge_index.numel() > 0:
+            lo = int(edge_index.min())
+            hi = int(edge_index.max())
+            if lo < 0 or hi >= self.num_nodes:
+                raise ValueError(
+                    f"edge_index node ids must be in [0, {self.num_nodes}); "
+                    f"got range [{lo}, {hi}]. Check num_nodes or the index base."
+                )
+
         # For incoming=True: we want to iterate over incoming neighbors
         # So we sort by target (edge_index[1]) and store sources
         if incoming:

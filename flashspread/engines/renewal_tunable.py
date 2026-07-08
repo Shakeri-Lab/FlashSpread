@@ -308,19 +308,8 @@ class RenewalEngineTunableCUDAGraph(RenewalEngineTunable):
         self.step_time_accumulator.add_(tau)
 
     def _capture_graph(self) -> None:
-        """Capture CUDA Graph of multiple steps."""
-        # Warmup runs
-        for _ in range(3):
-            self._static_step()
-        torch.cuda.synchronize()
-
-        # Capture graph
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(self.steps_per_launch):
-                self._static_step()
-
-        self.graph_exec = g
+        """Capture CUDA Graph of multiple steps (with snapshot/restore)."""
+        self._capture_multistep_graph()
 
     def step(self) -> Tuple[float, torch.Tensor]:
         """

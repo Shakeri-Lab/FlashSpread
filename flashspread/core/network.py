@@ -34,7 +34,14 @@ class FixedDegreeGraph:
     as it provides uniform contact structure.
     """
 
-    def __init__(self, num_nodes: int, degree: int, device: str | torch.device = "cuda"):
+    def __init__(
+        self,
+        num_nodes: int,
+        degree: int,
+        device: str | torch.device = "cuda",
+        symmetric: bool = True,
+        seed: int | None = None,
+    ):
         """
         Create a random regular graph.
 
@@ -42,14 +49,24 @@ class FixedDegreeGraph:
             num_nodes: Number of nodes.
             degree: Degree of each node (must be even and < num_nodes).
             device: Device for tensors.
+            symmetric: If True (default), store both directions of every
+                undirected edge so each node's in-degree equals ``degree``
+                (a proper undirected contact network). If False, keep the
+                legacy behaviour where NetworkX enumerates each edge once,
+                giving asymmetric ~degree/2 in-degree — retained only to
+                reproduce pre-v1.1 results.
+            seed: Random seed for the NetworkX generator (reproducibility).
         """
         self.num_nodes = num_nodes
         self.degree = degree
         self.device = torch.device(device)
+        self.symmetric = bool(symmetric)
 
         # Create random regular graph
-        self._nx_graph = nx.random_regular_graph(degree, num_nodes)
-        self._edge_index = _edge_index_from_networkx(self._nx_graph).to(self.device)
+        self._nx_graph = nx.random_regular_graph(degree, num_nodes, seed=seed)
+        self._edge_index = _edge_index_from_networkx(
+            self._nx_graph, directed=not self.symmetric
+        ).to(self.device)
 
         # Build CSR for efficient kernel access
         self._csr = GraphCSR(self._edge_index, num_nodes, incoming=True)
@@ -79,7 +96,12 @@ class RandomGeometricGraph:
     """
 
     def __init__(
-        self, num_nodes: int, radius: float, device: str | torch.device = "cuda"
+        self,
+        num_nodes: int,
+        radius: float,
+        device: str | torch.device = "cuda",
+        symmetric: bool = True,
+        seed: int | None = None,
     ):
         """
         Create a random geometric graph.
@@ -88,13 +110,20 @@ class RandomGeometricGraph:
             num_nodes: Number of nodes.
             radius: Connection radius.
             device: Device for tensors.
+            symmetric: If True (default), store both directions of every
+                undirected edge so adjacency is symmetric. See
+                :class:`FixedDegreeGraph` for the rationale.
+            seed: Random seed for the NetworkX generator (reproducibility).
         """
         self.num_nodes = num_nodes
         self.radius = radius
         self.device = torch.device(device)
+        self.symmetric = bool(symmetric)
 
-        self._nx_graph = nx.random_geometric_graph(num_nodes, radius)
-        self._edge_index = _edge_index_from_networkx(self._nx_graph).to(self.device)
+        self._nx_graph = nx.random_geometric_graph(num_nodes, radius, seed=seed)
+        self._edge_index = _edge_index_from_networkx(
+            self._nx_graph, directed=not self.symmetric
+        ).to(self.device)
         self._csr = GraphCSR(self._edge_index, num_nodes, incoming=True)
 
     @property
@@ -119,7 +148,12 @@ class BarabasiAlbertGraph:
     """
 
     def __init__(
-        self, num_nodes: int, num_attachments: int, device: str | torch.device = "cuda"
+        self,
+        num_nodes: int,
+        num_attachments: int,
+        device: str | torch.device = "cuda",
+        symmetric: bool = True,
+        seed: int | None = None,
     ):
         """
         Create a Barabasi-Albert graph.
@@ -128,13 +162,20 @@ class BarabasiAlbertGraph:
             num_nodes: Number of nodes.
             num_attachments: Number of edges to attach from each new node.
             device: Device for tensors.
+            symmetric: If True (default), store both directions of every
+                undirected edge so adjacency is symmetric. See
+                :class:`FixedDegreeGraph` for the rationale.
+            seed: Random seed for the NetworkX generator (reproducibility).
         """
         self.num_nodes = num_nodes
         self.num_attachments = num_attachments
         self.device = torch.device(device)
+        self.symmetric = bool(symmetric)
 
-        self._nx_graph = nx.barabasi_albert_graph(num_nodes, num_attachments)
-        self._edge_index = _edge_index_from_networkx(self._nx_graph).to(self.device)
+        self._nx_graph = nx.barabasi_albert_graph(num_nodes, num_attachments, seed=seed)
+        self._edge_index = _edge_index_from_networkx(
+            self._nx_graph, directed=not self.symmetric
+        ).to(self.device)
         self._csr = GraphCSR(self._edge_index, num_nodes, incoming=True)
 
     @property
@@ -163,6 +204,8 @@ class WattsStrogatzGraph:
         k: int,
         p: float,
         device: str | torch.device = "cuda",
+        symmetric: bool = True,
+        seed: int | None = None,
     ):
         """
         Create a Watts-Strogatz small-world graph.
@@ -172,14 +215,21 @@ class WattsStrogatzGraph:
             k: Each node connected to k nearest neighbors in ring topology.
             p: Probability of rewiring each edge.
             device: Device for tensors.
+            symmetric: If True (default), store both directions of every
+                undirected edge so adjacency is symmetric. See
+                :class:`FixedDegreeGraph` for the rationale.
+            seed: Random seed for the NetworkX generator (reproducibility).
         """
         self.num_nodes = num_nodes
         self.k = k
         self.p = p
         self.device = torch.device(device)
+        self.symmetric = bool(symmetric)
 
-        self._nx_graph = nx.watts_strogatz_graph(num_nodes, k, p)
-        self._edge_index = _edge_index_from_networkx(self._nx_graph).to(self.device)
+        self._nx_graph = nx.watts_strogatz_graph(num_nodes, k, p, seed=seed)
+        self._edge_index = _edge_index_from_networkx(
+            self._nx_graph, directed=not self.symmetric
+        ).to(self.device)
         self._csr = GraphCSR(self._edge_index, num_nodes, incoming=True)
 
     @property
