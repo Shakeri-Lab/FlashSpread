@@ -1,0 +1,2 @@
+N,degree,edges,fused_nups,fused_time_per_step_ms,fused_gflops,fused_ai,flops_per_step,bytes_per_step,full_run_steps,full_run_events,events_per_nups,events_per_s_at_headline,final_attack_rate
+1000000,8,8000000,4552672140.2,0.2197,341.5,0.647,75000000,116000004,1800,2944691,1.636e-03,7447895.9,0.972

@@ -599,6 +599,11 @@ def main():
         help="Number of nodes in the network (default: 1,000,000)"
     )
     parser.add_argument(
+        "--degree", type=int, default=8,
+        help="Mean degree of the (symmetric) benchmark graph (default: 8, "
+             "matching the manuscript's d=8 setup)"
+    )
+    parser.add_argument(
         "--output-dir", type=str, default="results",
         help="Output directory for results (default: results)"
     )
@@ -633,6 +638,7 @@ def main():
     # Get configs with updated parameters
     configs = get_default_configs(args.num_nodes)
     for config in configs:
+        config.degree = args.degree
         config.warmup_steps = args.warmup_steps
         config.benchmark_steps = args.benchmark_steps
 

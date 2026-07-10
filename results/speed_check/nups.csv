@@ -1,0 +1,17 @@
+graph,kernel,nodes_per_block,edges_per_merge_block,nups
+FixedDegree d=8,thread,0,0,4672431510.7
+FixedDegree d=8,warp,2,0,766132102.9
+FixedDegree d=8,warp,4,0,1233900061.9
+FixedDegree d=8,warp,8,0,1464545766.1
+FixedDegree d=8,merge,0,1024,2380041691.5
+FixedDegree d=8,merge,0,2048,2001066036.8
+FixedDegree d=8,merge,0,4096,2022417576.6
+FixedDegree d=8,merge,0,8192,819613256.3
+BA m=4,thread,0,0,434083064.7
+BA m=4,warp,2,0,741974918.7
+BA m=4,warp,4,0,1158382662.7
+BA m=4,warp,8,0,1302514901.7
+BA m=4,merge,0,1024,1956189338.5
+BA m=4,merge,0,2048,1756444154.1
+BA m=4,merge,0,4096,1854042235.3
+BA m=4,merge,0,8192,813115283.3

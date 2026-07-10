@@ -1,0 +1,2 @@
+N,degree,edges,total_steps,total_events,wall_s,nups,events_per_s,events_per_nups
+1000000,8,8000000,2000,2965986,0.5452,3668042593.1,5439681.5,1.483e-03
