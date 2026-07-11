@@ -182,11 +182,27 @@ def main():
                 print(f"  {eng_name:>20s}: FAILED - {e}")
                 torch.cuda.empty_cache()
 
-    # Plot
+    # Summary CSV first, so a headless node without matplotlib never loses the data.
+    csv_path = args.output.replace(".png", ".csv")
+    with open(csv_path, "w") as f:
+        f.write("engine,N,events_per_sec\n")
+        for algo, data in ORIGINAL_DATA.items():
+            for n, eps in sorted(data.items()):
+                f.write(f"{algo},{n},{eps:.1f}\n")
+        for eng_name, data in results.items():
+            for n, eps in sorted(data.items()):
+                f.write(f"{eng_name},{n},{eps:.1f}\n")
+    print(f"Saved: {csv_path}")
+
+    # Plot (optional: matplotlib is not needed for the CSV artefact).
     print("\nGenerating plot...", flush=True)
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as _e:
+        print(f"[plot skipped: matplotlib unavailable: {_e}]")
+        return
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -234,18 +250,6 @@ def main():
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.output, dpi=150, bbox_inches="tight")
     print(f"Saved: {args.output}")
-
-    # Summary CSV
-    csv_path = args.output.replace(".png", ".csv")
-    with open(csv_path, "w") as f:
-        f.write("engine,N,events_per_sec\n")
-        for algo, data in ORIGINAL_DATA.items():
-            for n, eps in sorted(data.items()):
-                f.write(f"{algo},{n},{eps:.1f}\n")
-        for eng_name, data in results.items():
-            for n, eps in sorted(data.items()):
-                f.write(f"{eng_name},{n},{eps:.1f}\n")
-    print(f"Saved: {csv_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+engine,N,nups
+CPU tau-leaping,1000,1382858.5
+CPU tau-leaping,10000,5876354.5
+CPU tau-leaping,100000,22103038.0
+CPU tau-leaping,1000000,18941334.9
