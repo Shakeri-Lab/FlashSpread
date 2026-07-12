@@ -1,5 +1,5 @@
 graph,implementation,constant_nups,age_dependent_nups,slowdown
-Regular (d=8),Pre-pass,4522771656.3,3477825026.5,0.3005
-Regular (d=8),In-kernel,4824075210.7,4828405845.3,-0.0009
-BA (m=4),Pre-pass,526921336.9,502424005.6,0.0488
-BA (m=4),In-kernel,530542673.7,530805310.3,-0.0005
+Regular (d=8),Pre-pass,4356541249.4,3375300458.9,0.2907
+Regular (d=8),In-kernel,4689146119.2,4586058580.9,0.0225
+BA (m=4),Pre-pass,432206274.1,414751146.4,0.0421
+BA (m=4),In-kernel,435180024.8,434908537.9,0.0006

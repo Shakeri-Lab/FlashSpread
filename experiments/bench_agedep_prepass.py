@@ -107,14 +107,21 @@ def main():
     ap.add_argument("--num-nodes", type=int, default=1_000_000)
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--graph-seed", type=int, default=42,
+                    help="Graph seed; 42 matches the other BA benchmarks.")
     ap.add_argument("--output", type=str,
                     default="results/agedep_prepass.csv")
     args = ap.parse_args()
 
+    # Graph seed 42 matches every other BA benchmark in this repo
+    # (nx.barabasi_albert_graph(N, m, seed=42) + both edge directions), which the
+    # public symmetric BarabasiAlbertGraph reproduces exactly. Keeping the seed
+    # aligned matters because the 1-thread-per-node kernel is D_max-bound, so a
+    # different BA realisation shifts throughput noticeably.
     dev, N = args.device, args.num_nodes
     graphs = [
-        ("Regular (d=8)", FixedDegreeGraph(N, 8, device=dev, seed=0)),
-        ("BA (m=4)", BarabasiAlbertGraph(N, 4, device=dev, seed=0)),
+        ("Regular (d=8)", FixedDegreeGraph(N, 8, device=dev, seed=args.graph_seed)),
+        ("BA (m=4)", BarabasiAlbertGraph(N, 4, device=dev, seed=args.graph_seed)),
     ]
 
     common = dict(device=dev, epsilon=EPSILON, tau_max=TAU_MAX,

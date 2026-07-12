@@ -22,8 +22,10 @@ PY="${FLASHSPREAD_PY:-/home/hs9hd/.conda/envs/hpo_edu/bin/python}"
 
 "${PY}" -c "import torch, flashspread; assert torch.cuda.is_available(); print('torch', torch.__version__, torch.cuda.get_device_name(0))"
 
+# 10 trials: the in-kernel age-dependent overhead is a small difference between
+# two large throughputs, so 3 trials left it inside run-to-run GPU variance.
 "${PY}" experiments/bench_agedep_prepass.py \
-    --num-nodes 1000000 --trials 3 --device cuda \
+    --num-nodes 1000000 --trials 10 --graph-seed 42 --device cuda \
     --output results/speed_check/agedep_prepass.csv
 
 echo "--- agedep_prepass.csv ---"
