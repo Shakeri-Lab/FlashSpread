@@ -19,75 +19,93 @@ FlashSpread is the first GPU-accelerated framework for simulating both Markovian
 git clone https://github.com/Shakeri-Lab/FlashSpread.git
 cd FlashSpread
 
-# Install in development mode
+# Base install (CPU-importable: torch + numpy only)
 pip install -e .
 
-# Or install directly
-pip install .
+# On a CUDA machine, add the GPU kernels and the graph generators
+pip install -e ".[gpu,graph]"
+```
+
+The base install imports without a GPU, so the package can be used and tested on
+a CPU-only machine or CI runner. The optional extras are:
+
+| Extra | Brings in | Needed for |
+|---|---|---|
+| `gpu` | `triton` | the fused Triton kernels / all GPU engines |
+| `graph` | `networkx`, `scipy` | the graph generators, RCM reordering |
+| `dev` | `pytest`, `ruff`, `mypy` | development |
+
+Check what your environment supports:
+
+```python
+import flashspread as fs
+fs.check_env()          # reports torch/CUDA/triton/networkx, and gpu_ready
 ```
 
 ### Requirements
-- Python >= 3.10
-- PyTorch >= 2.0
-- Triton >= 2.1
-- NetworkX >= 3.0
-- NumPy >= 1.24
-- CUDA-capable GPU
+- Python >= 3.10, PyTorch >= 2.0, NumPy >= 1.24 (base)
+- Triton >= 2.1 + a CUDA GPU (for the GPU engines; `[gpu]` extra)
+- NetworkX >= 3.0, SciPy (for the graph generators; `[graph]` extra)
 
 ## Quick Start
 
-### Markovian SIS Simulation
+`Simulator` is the one entry point: it picks the right engine for your model,
+resolves the device, owns the seed, and returns a `Trajectory`.
+
+### Non-Markovian SEIR (renewal; runs on CPU or GPU)
 
 ```python
-import torch
-from flashspread.engines import MarkovianEngine
-from flashspread.models import SISModel
-from flashspread.core import FixedDegreeGraph
+import flashspread as fs
 
-# Create network (10,000 nodes, degree 15)
-graph = FixedDegreeGraph(num_nodes=10000, degree=15, device="cuda")
+# Symmetric contact network (every node really has `degree` neighbours)
+graph = fs.regular_graph(10_000, degree=8, seed=0)
 
-# Define SIS model
-model = SISModel(beta=0.5, delta=1.0)
-
-# Create engine and run
-engine = MarkovianEngine(graph, model, device="cuda")
-engine.seed_infection(num_infected=100)
-
-# Simulate for 100 time units
-for _ in range(1000):
-    engine.step()
-
-print(f"Final infected: {engine.count_infected()}")
-```
-
-### Non-Markovian SEIR Simulation
-
-```python
-import torch
-from flashspread.engines import RenewalEngine
-from flashspread.models import SEIRModel
-
-# Create network
-graph = FixedDegreeGraph(num_nodes=10000, degree=15, device="cuda")
-
-# Define SEIR with log-normal transitions
-model = SEIRModel(
-    beta=0.3,
-    mean_ei=5.0, median_ei=4.0,   # E->I log-normal
-    mean_ir=3.9, median_ir=1.5    # I->R log-normal
+# Log-normal dwell times (requires mean > median > 0)
+model = fs.SEIRModel(
+    beta=0.25,
+    mean_ei=5.0, median_ei=4.0,   # E -> I
+    mean_ir=7.5, median_ir=5.0,   # I -> R
 )
 
-# Create renewal engine
-engine = RenewalEngine(graph, model, device="cuda", epsilon=0.03)
-engine.seed_infection(num_exposed=100)
+sim  = fs.Simulator(graph, model, seed=0).seed_infection(100)
+traj = sim.run(until=50.0, record_every=1.0)
 
-# Simulate until time T=50
-while engine.current_time < 50.0:
-    engine.step()
+print(f"peak infected : {traj.peak_infected} at t={traj.peak_time:.1f}")
+print(f"attack rate   : {traj.final_attack_rate:.3f}")
+print(traj["I"])            # the I(t) series; traj.to_dict() -> DataFrame-ready
+```
 
-counts = engine.count_by_state()
-print(f"S={counts[0]}, E={counts[1]}, I={counts[2]}, R={counts[3]}")
+### Markovian SIS / SIR (sparse engine; **GPU only**)
+
+```python
+import flashspread as fs
+
+graph = fs.regular_graph(10_000, degree=8, seed=0, device="cuda")
+model = fs.SISModel(beta=0.5, delta=0.2)
+
+sim  = fs.Simulator(graph, model, device="cuda", seed=0).seed_infection(100)
+traj = sim.run(until=30.0)
+
+print(traj.peak_infected)
+```
+
+> **The stop time is granular.** With the default batched CUDA-Graph engine the
+> simulation advances 50 internal steps per call and cannot stop mid-window, so
+> `run(until=50)` may finish nearer t=53. `traj.times[-1]` is always the true end
+> time — never assume it equals `until`. For a tight horizon pass
+> `steps_per_launch=2` (the fused engine double-buffers, so it rounds an odd
+> window up to the next even number) or `use_cuda_graph=False` for an exact stop.
+> `sim.steps_per_launch` reports the window you actually got.
+
+### Power users: the engine zoo
+
+`Simulator` wraps the engine factories; the engines stay directly reachable.
+
+```python
+from flashspread.engines import create_renewal_engine, RenewalEngineFusedCUDAGraph
+
+engine = create_renewal_engine(graph, model, device="cuda")  # fused CUDA-Graph
+tau, state = engine.step()
 ```
 
 ## Architecture

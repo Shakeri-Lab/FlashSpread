@@ -33,6 +33,29 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def is_markovian(model) -> bool:
+    """Whether a compartmental model is Markovian (SIS/SIR) vs renewal (SEIR).
+
+    Prefers an explicit ``is_markovian`` class attribute; falls back to a
+    capability check (renewal models expose ``compute_infectivity``).
+    """
+    if hasattr(model, "is_markovian"):
+        return bool(model.is_markovian)
+    return not hasattr(model, "compute_infectivity")
+
+
+def state_names(model) -> list[str]:
+    """Return single-letter state names in index order, e.g. ('S','E','I','R').
+
+    Falls back to ``state{i}`` for any index without a known attribute.
+    """
+    idx_to_name = {}
+    for attr in ("susceptible", "exposed", "infected", "recovered"):
+        if hasattr(model, attr):
+            idx_to_name[getattr(model, attr)] = attr[0].upper()
+    return [idx_to_name.get(i, f"state{i}") for i in range(model.num_states)]
+
+
 def _has(module: str) -> bool:
     """True if ``module`` is importable, without importing it.
 
