@@ -367,12 +367,11 @@ run reports **347 passed, 45 skipped**; the final selected A100 validation repor
 ## Citation
 
 ```bibtex
-@article{shakeri2025flashspread,
-  title={FlashSpread: A Unified GPU Framework for Markovian and Non-Markovian
-         Spreading Processes on Complex Networks},
-  author={Shakeri, Heman},
-  journal={},
-  year={2025}
+@article{shakeri2026flashspread,
+  title={FlashSpread: IO-Aware GPU Simulation of Non-Markovian Epidemic Dynamics via Kernel Fusion},
+  author={Shakeri, Heman and Moradi-Jamei, Behnaz and Vajdi, Aram and Ardjmand, Ehsan},
+  journal={arXiv preprint arXiv:2604.22092},
+  year={2026}
 }
 ```
 
