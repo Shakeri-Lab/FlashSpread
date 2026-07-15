@@ -9,6 +9,8 @@ from .compartmental import SISModel, SIRModel, SEIRModel
 from .hazards import (
     lognormal_hazard,
     lognormal_hazard_stable,
+    weibull_hazard,
+    gamma_hazard,
     build_hazard_from_params,
 )
 
@@ -18,5 +20,7 @@ __all__ = [
     "SEIRModel",
     "lognormal_hazard",
     "lognormal_hazard_stable",
+    "weibull_hazard",
+    "gamma_hazard",
     "build_hazard_from_params",
 ]

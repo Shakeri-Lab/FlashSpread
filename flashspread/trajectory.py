@@ -25,6 +25,9 @@ class Trajectory:
             of ``counts`` (e.g. ``("S", "E", "I", "R")``).
         inducer_states: state indices that count as "infectious".
         num_nodes: total population size.
+        susceptible_state: column index of the susceptible compartment. The
+            default of 0 preserves direct construction for conventional
+            S-first models.
     """
 
     times: np.ndarray
@@ -32,6 +35,7 @@ class Trajectory:
     state_names: tuple[str, ...]
     inducer_states: tuple[int, ...]
     num_nodes: int
+    susceptible_state: int = 0
 
     @property
     def infected(self) -> np.ndarray:
@@ -50,12 +54,19 @@ class Trajectory:
 
     @property
     def final_attack_rate(self) -> float:
-        """Fraction of the population ever infected: (N - final S) / N.
+        """Final non-susceptible fraction: ``(N - final S) / N``.
 
-        State index 0 is Susceptible in every FlashSpread model.
+        This is cumulative attack rate for absorbing SIR/SEIR dynamics. For
+        SIS, where nodes return to S, use :attr:`final_prevalence`; cumulative
+        ever-infected history is not recoverable from compartment counts.
         """
-        final_susceptible = self.counts[-1, 0]
+        final_susceptible = self.counts[-1, self.susceptible_state]
         return float((self.num_nodes - final_susceptible) / self.num_nodes)
+
+    @property
+    def final_prevalence(self) -> float:
+        """Fraction infectious at the final recorded time."""
+        return float(self.infected[-1] / self.num_nodes)
 
     def to_dict(self) -> dict:
         """Column-oriented dict (``{"time": ..., "S": ..., ...}``).

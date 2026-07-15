@@ -1,6 +1,10 @@
 #!/usr/bin/env python
-"""
-Mixed-precision storage ablation (Step 3 of the effective-bandwidth plan).
+"""Legacy mixed-storage ablation; all results must be remeasured.
+
+The production mixed path now retains fp32 age clocks. This script can compare
+current fp32 versus mixed storage, but its historical CSV cannot support the
+manuscript's old fp16-age working-set, bandwidth, or scale claims. Prefer
+``benchmark_acceptance.py`` for publication measurements and provenance.
 
 Baseline:
     state       int32
@@ -10,7 +14,7 @@ Baseline:
 
 Mixed precision (use_mixed_precision=True):
     state       int8       (4x state traffic)
-    age         float16    (2x age traffic)
+    age         float32    (unchanged; prevents small-tau clock freeze)
     infectivity bfloat16   (2x infectivity traffic)
     weights     bfloat16   (2x weight traffic)
     pressure accumulator STILL fp32 inside the kernel (mandatory:
@@ -24,8 +28,8 @@ against the baseline; mixed precision is NOT bit-identical by design
 (7-bit bf16 mantissa vs 23-bit fp32), so we use a tolerance check on
 final compartment counts.
 
-Restricted to csr_strategy='thread' because only the thread-path
-fused kernel carries the MIXED_PRECISION constexpr today.
+This historical matrix remains restricted to ``csr_strategy='thread'`` for
+comparability; the production kernel supports mixed storage in every strategy.
 """
 
 from __future__ import annotations
@@ -57,7 +61,9 @@ STEPS_PER_LAUNCH = 50
 
 def _build_er(N, device):
     g = FixedDegreeGraph(N, NLINK, device=device)
-    class GW: pass
+    class GW:
+        pass
+
     gw = GW()
     gw.csr = g.csr
     gw.edge_index = g.edge_index
@@ -75,7 +81,9 @@ def _build_ba(N, m, device):
         edges.append([v, u])
     ei = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device)
     csr = GraphCSR(ei, N, incoming=True)
-    class GW: pass
+    class GW:
+        pass
+
     gw = GW()
     gw.csr = csr
     gw.edge_index = ei
@@ -174,7 +182,7 @@ def main():
         print(f"=== {label}: baseline (fp32/int32) ===")
         base = bench_cell(gw, label, False, args.trials, device)
 
-        print(f"=== {label}: mixed precision (int8/fp16/bf16) ===")
+        print(f"=== {label}: mixed storage (int8/fp32/bf16) ===")
         mixed = bench_cell(gw, label, True, args.trials, device)
 
         base_nups = np.array([r["nups_per_s"] for r in base])

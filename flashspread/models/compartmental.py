@@ -13,9 +13,12 @@ Each model defines:
 - Transition application method
 """
 
+import math
+
 import torch
 from typing import Optional
 
+from ..utils import validate_fp32_control
 from .hazards import lognormal_hazard_stable
 
 
@@ -34,6 +37,8 @@ class SISModel:
     This is a Markovian model suitable for the MarkovianEngine.
     """
 
+    is_markovian = True
+
     def __init__(self, beta: float = 0.5, delta: float = 1.0):
         """
         Initialize SIS model.
@@ -42,8 +47,8 @@ class SISModel:
             beta: Infection rate per infected neighbor.
             delta: Recovery rate.
         """
-        self.beta = float(beta)
-        self.delta = float(delta)
+        self.beta = validate_fp32_control("beta", beta, nonnegative=True)
+        self.delta = validate_fp32_control("delta", delta, nonnegative=True)
 
         # State definitions
         self.susceptible = 0
@@ -140,6 +145,8 @@ class SIRModel:
     This is a Markovian model suitable for the MarkovianEngine.
     """
 
+    is_markovian = True
+
     def __init__(self, beta: float = 0.5, gamma: float = 0.1):
         """
         Initialize SIR model.
@@ -148,8 +155,8 @@ class SIRModel:
             beta: Infection rate per infected neighbor.
             gamma: Recovery rate.
         """
-        self.beta = float(beta)
-        self.gamma = float(gamma)
+        self.beta = validate_fp32_control("beta", beta, nonnegative=True)
+        self.gamma = validate_fp32_control("gamma", gamma, nonnegative=True)
 
         self.susceptible = 0
         self.infected = 1
@@ -226,6 +233,8 @@ class SEIRModel:
     This model requires the RenewalEngine.
     """
 
+    is_markovian = False
+
     def __init__(
         self,
         beta: float = 0.3,
@@ -233,6 +242,7 @@ class SEIRModel:
         median_ei: float = 4.0,
         mean_ir: float = 3.9,
         median_ir: float = 1.5,
+        transmission_mode: str = "constant",
     ):
         """
         Initialize SEIR model with log-normal transitions.
@@ -244,11 +254,24 @@ class SEIRModel:
             mean_ir: Mean infectious period (I->R).
             median_ir: Median infectious period.
         """
-        self.beta = float(beta)
-        self.mean_ei = float(mean_ei)
-        self.median_ei = float(median_ei)
-        self.mean_ir = float(mean_ir)
-        self.median_ir = float(median_ir)
+        self.beta = validate_fp32_control("beta", beta, nonnegative=True)
+        self.mean_ei = validate_fp32_control(
+            "mean_ei", mean_ei, positive=True
+        )
+        self.median_ei = validate_fp32_control(
+            "median_ei", median_ei, positive=True
+        )
+        self.mean_ir = validate_fp32_control(
+            "mean_ir", mean_ir, positive=True
+        )
+        self.median_ir = validate_fp32_control(
+            "median_ir", median_ir, positive=True
+        )
+        if transmission_mode not in ("constant", "age_dependent"):
+            raise ValueError(
+                "transmission_mode must be 'constant' or 'age_dependent', got "
+                f"{transmission_mode!r}"
+            )
 
         # A log-normal dwell time requires mean > median > 0. Otherwise
         # sigma = sqrt(2*ln(mean/median)) becomes NaN (mean < median) or
@@ -259,6 +282,11 @@ class SEIRModel:
             ("E->I (incubation)", self.mean_ei, self.median_ei),
             ("I->R (infectious)", self.mean_ir, self.median_ir),
         ):
+            if not math.isfinite(mean) or not math.isfinite(median):
+                raise ValueError(
+                    f"SEIRModel {name}: mean and median must be finite, "
+                    f"got mean={mean}, median={median}."
+                )
             if not (median > 0.0):
                 raise ValueError(
                     f"SEIRModel {name}: median must be > 0, got median={median}."
@@ -287,7 +315,7 @@ class SEIRModel:
         #   "age_dependent": infectivity[j] = beta * h_IR(age[j]) for I-nodes
         # "constant" matches the original RenewalEngine semantics.
         # "age_dependent" uses the source-node compromise for true non-Markovian edges.
-        self.transmission_mode = "constant"
+        self.transmission_mode = transmission_mode
 
         # Device tensors
         self._beta_t = None
@@ -302,16 +330,23 @@ class SEIRModel:
         self._beta_t = torch.tensor(self.beta, device=device, dtype=dtype)
 
         # Convert mean/median to log-normal parameters (mu, sigma)
-        median_ei = torch.tensor(self.median_ei, device=device, dtype=dtype)
-        mean_ei = torch.tensor(self.mean_ei, device=device, dtype=dtype)
-        median_ir = torch.tensor(self.median_ir, device=device, dtype=dtype)
-        mean_ir = torch.tensor(self.mean_ir, device=device, dtype=dtype)
-
         # mu = ln(median), sigma = sqrt(2 * ln(mean/median))
-        self._mu_ei = torch.log(median_ei)
-        self._sig_ei = torch.sqrt(2.0 * torch.log(mean_ei / median_ei))
-        self._mu_ir = torch.log(median_ir)
-        self._sig_ir = torch.sqrt(2.0 * torch.log(mean_ir / median_ir))
+        mu_ei = validate_fp32_control("log(median_ei)", math.log(self.median_ei))
+        sig_ei = validate_fp32_control(
+            "sigma_ei",
+            math.sqrt(2.0 * math.log(self.mean_ei / self.median_ei)),
+            positive=True,
+        )
+        mu_ir = validate_fp32_control("log(median_ir)", math.log(self.median_ir))
+        sig_ir = validate_fp32_control(
+            "sigma_ir",
+            math.sqrt(2.0 * math.log(self.mean_ir / self.median_ir)),
+            positive=True,
+        )
+        self._mu_ei = torch.tensor(mu_ei, device=device, dtype=dtype)
+        self._sig_ei = torch.tensor(sig_ei, device=device, dtype=dtype)
+        self._mu_ir = torch.tensor(mu_ir, device=device, dtype=dtype)
+        self._sig_ir = torch.tensor(sig_ir, device=device, dtype=dtype)
 
     def compute_rates(
         self,
@@ -335,6 +370,24 @@ class SEIRModel:
         Returns:
             [N] tensor of hazard rates.
         """
+        return self._compute_rates_impl(
+            age,
+            state,
+            pressure,
+            susceptible_scale=self._beta_t,
+            out=out,
+        )
+
+    def _compute_rates_impl(
+        self,
+        age: torch.Tensor,
+        state: torch.Tensor,
+        pressure: torch.Tensor,
+        *,
+        susceptible_scale: torch.Tensor | None,
+        out: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Shared SEIR evaluator for raw and already-scaled pressure."""
         if out is None:
             out = torch.zeros_like(age)
         else:
@@ -345,9 +398,10 @@ class SEIRModel:
         i_mask = state == self.infected
 
         if self.sparse_hazard:
-            # Compute hazards only for nodes in relevant states
-            out[s_mask] = pressure[s_mask] * self._beta_t
-
+            susceptible_rate = pressure[s_mask]
+            if susceptible_scale is not None:
+                susceptible_rate = susceptible_rate * susceptible_scale
+            out[s_mask] = susceptible_rate
             if e_mask.any():
                 out[e_mask] = lognormal_hazard_stable(
                     age[e_mask], self._mu_ei, self._sig_ei
@@ -356,19 +410,18 @@ class SEIRModel:
                 out[i_mask] = lognormal_hazard_stable(
                     age[i_mask], self._mu_ir, self._sig_ir
                 )
-        else:
-            # Dense computation (for CUDA Graph compatibility)
-            # Must modify out in-place since caller may ignore return value
-            hazard_e = lognormal_hazard_stable(age, self._mu_ei, self._sig_ei)
-            hazard_i = lognormal_hazard_stable(age, self._mu_ir, self._sig_ir)
-            rate_s = pressure * self._beta_t
+            return out
 
-            # Use in-place operations for CUDA Graph compatibility
-            out.copy_(torch.where(s_mask, rate_s, out))
-            out.copy_(torch.where(e_mask, hazard_e, out))
-            out.copy_(torch.where(i_mask, hazard_i, out))
-
+        # Dense computation keeps fixed shapes and modifies the caller's
+        # buffer in place for CUDA Graph capture.
+        rate_s = pressure if susceptible_scale is None else pressure * susceptible_scale
+        hazard_e = lognormal_hazard_stable(age, self._mu_ei, self._sig_ei)
+        hazard_i = lognormal_hazard_stable(age, self._mu_ir, self._sig_ir)
+        out.copy_(torch.where(s_mask, rate_s, out))
+        out.copy_(torch.where(e_mask, hazard_e, out))
+        out.copy_(torch.where(i_mask, hazard_i, out))
         return out
+
 
     def compute_infectivity(
         self,
@@ -434,37 +487,13 @@ class SEIRModel:
         Returns:
             [N] tensor of hazard rates.
         """
-        if out is None:
-            out = torch.zeros_like(age)
-        else:
-            out.zero_()
-
-        s_mask = state == self.susceptible
-        e_mask = state == self.exposed
-        i_mask = state == self.infected
-
-        if self.sparse_hazard:
-            # S: rate = pressure (already includes beta * h_IR from infectivity)
-            out[s_mask] = pressure[s_mask]
-
-            if e_mask.any():
-                out[e_mask] = lognormal_hazard_stable(
-                    age[e_mask], self._mu_ei, self._sig_ei
-                )
-            if i_mask.any():
-                out[i_mask] = lognormal_hazard_stable(
-                    age[i_mask], self._mu_ir, self._sig_ir
-                )
-        else:
-            # Dense (CUDA Graph compatible)
-            hazard_e = lognormal_hazard_stable(age, self._mu_ei, self._sig_ei)
-            hazard_i = lognormal_hazard_stable(age, self._mu_ir, self._sig_ir)
-
-            out.copy_(torch.where(s_mask, pressure, out))
-            out.copy_(torch.where(e_mask, hazard_e, out))
-            out.copy_(torch.where(i_mask, hazard_i, out))
-
-        return out
+        return self._compute_rates_impl(
+            age,
+            state,
+            pressure,
+            susceptible_scale=None,
+            out=out,
+        )
 
     def apply_transitions(
         self,
@@ -486,3 +515,20 @@ class SEIRModel:
         out[event_mask & (state == self.infected)] = self.recovered
 
         return out
+
+
+# Capture fused-kernel semantic hooks after the class is complete. Comparing
+# against ``SEIRModel.<name>`` later is insufficient because a class-level
+# monkeypatch would otherwise move both the implementation and its purported
+# reference identity together.
+_SEIR_FUSED_BUILTIN_HOOKS = tuple(
+    (name, getattr(SEIRModel, name))
+    for name in (
+        "prepare",
+        "compute_rates",
+        "compute_rates_nonmarkov",
+        "compute_infectivity",
+        "_compute_rates_impl",
+        "apply_transitions",
+    )
+)

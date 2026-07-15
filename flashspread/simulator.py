@@ -28,36 +28,60 @@ from __future__ import annotations
 
 import numpy as np
 
-from .engines import create_markovian_engine, create_renewal_engine
+from .config import EngineConfig
 from .trajectory import Trajectory
-from .utils import is_markovian, resolve_device, seed_everything, state_names
+from .utils import (
+    is_markovian,
+    resolve_device,
+    seed_everything,
+    state_names,
+    validate_compartment,
+)
 
 
 class Simulator:
     """High-level driver that selects and owns the appropriate engine.
 
     Args:
-        graph: a FlashSpread graph (e.g. from :func:`flashspread.regular_graph`)
-            or anything exposing ``csr``/``row_ptr`` and ``num_nodes``.
+        graph: a :class:`GraphCSR` or a generated graph exposing one as ``csr``.
         model: a compartmental model (``SISModel``, ``SIRModel``, ``SEIRModel``).
         device: ``"cuda"``, ``"cpu"``, a ``torch.device``, or None to auto-detect.
         seed: base RNG seed, for reproducible runs.
+        config: optional immutable :class:`EngineConfig`. It replaces legacy
+            engine-selection keywords; passing both is an error.
         engine: optional pre-built engine to use verbatim (escape hatch); when
             given, engine auto-selection is skipped.
         **engine_kwargs: forwarded to the engine factory (e.g. ``epsilon``,
             ``tau_max``, ``steps_per_launch``, ``use_cuda_graph``).
 
     Note:
-        The Markovian engine (SIS/SIR) requires a CUDA device; the renewal
-        engine (SEIR) also runs on CPU via its reference-influence fallback.
+        CPU execution is a correctness/reference path for both engine families.
+        The Triton kernels and CUDA Graph batching are selected on CUDA.
     """
 
-    def __init__(self, graph, model, *, device=None, seed: int | None = None,
-                 engine=None, **engine_kwargs):
+    def __init__(
+        self,
+        graph,
+        model,
+        *,
+        device=None,
+        seed: int | None = None,
+        config: EngineConfig | None = None,
+        engine=None,
+        **engine_kwargs,
+    ):
+        if config is not None and engine_kwargs:
+            raise ValueError(
+                "pass either config=EngineConfig(...) or legacy engine keyword "
+                "arguments, not both"
+            )
+        if engine is not None and device is None and hasattr(engine, "device"):
+            device = engine.device
         self.device = resolve_device(device)
         self.graph = graph
         self.model = model
         self._seed = seed
+        self.config = config
         self._engine_kwargs = engine_kwargs
         self._engine_override = engine
         self._build()
@@ -67,38 +91,65 @@ class Simulator:
             seed_everything(self._seed)
         if self._engine_override is not None:
             self._engine = self._engine_override
-            return
-        kwargs = dict(self._engine_kwargs)
-        if self._seed is not None:
-            kwargs.setdefault("seed", self._seed)
-
-        if is_markovian(self.model):
-            if self.device.type != "cuda":
-                raise RuntimeError(
-                    "The Markovian engine (SIS/SIR) requires a CUDA device: its "
-                    "influence kernel is GPU-only. Either use device='cuda', or "
-                    "use an age-dependent model (SEIRModel), which has a CPU "
-                    "fallback."
-                )
-            self._engine = create_markovian_engine(
-                self.graph, self.model, device=str(self.device), **kwargs)
+            self._validate_engine_override()
             return
 
-        if self.device.type != "cuda":
-            # The fused, CUDA-Graph and infectivity-kernel renewal paths are all
-            # GPU-only. The plain RenewalEngine has a reference-influence CPU
-            # fallback, so select it when there is no CUDA device.
-            kwargs.setdefault("use_cuda_graph", False)
-            kwargs.setdefault("use_fused", False)
-            kwargs.setdefault("nonmarkov_edges", False)
-        self._engine = create_renewal_engine(
-            self.graph, self.model, device=str(self.device), **kwargs)
+        # Import engine dispatch only when auto-building a simulation. An
+        # injected engine remains a genuinely lazy escape hatch.
+        from .engines import create_engine
+
+        self._engine = create_engine(
+            self.graph,
+            self.model,
+            device=str(self.device),
+            config=self.config,
+            seed=self._seed,
+            **self._engine_kwargs,
+        )
+
+    def _validate_engine_override(self) -> None:
+        """Ensure facade metadata describes the injected engine truthfully."""
+        engine = self._engine
+        if not hasattr(engine, "num_nodes"):
+            raise TypeError("an injected engine must expose num_nodes")
+        graph_csr = self.graph.csr if hasattr(self.graph, "csr") else self.graph
+        if not hasattr(graph_csr, "num_nodes"):
+            raise TypeError("graph must expose num_nodes directly or through .csr")
+        if int(engine.num_nodes) != int(graph_csr.num_nodes):
+            raise ValueError(
+                "injected engine and graph disagree on num_nodes: "
+                f"{engine.num_nodes} != {graph_csr.num_nodes}"
+            )
+        if hasattr(engine, "device") and str(self.device) != str(engine.device):
+            raise ValueError(
+                "injected engine and Simulator disagree on device: "
+                f"{engine.device} != {self.device}"
+            )
+        engine_model = getattr(engine, "model", None)
+        if engine_model is not None:
+            if is_markovian(engine_model) != is_markovian(self.model):
+                raise ValueError("injected engine uses the wrong model family")
+            if getattr(engine_model, "num_states", None) != getattr(
+                self.model, "num_states", None
+            ):
+                raise ValueError("injected engine model disagrees on num_states")
+            engine_inducers = tuple(getattr(engine_model, "inducer_states", ()))
+            facade_inducers = tuple(getattr(self.model, "inducer_states", ()))
+            if engine_inducers != facade_inducers:
+                raise ValueError("injected engine model disagrees on inducer_states")
+            if tuple(state_names(engine_model)) != tuple(state_names(self.model)):
+                raise ValueError("injected engine model disagrees on compartment mapping")
 
     # ---- underlying engine (power users) -----------------------------------
     @property
     def engine(self):
         """The engine instance this facade is driving."""
         return self._engine
+
+    @property
+    def num_nodes(self) -> int:
+        """Population size from the canonical engine graph."""
+        return int(self._engine.num_nodes)
 
     # ---- control surface ---------------------------------------------------
     def seed_infection(self, num_infected: int, state: int | None = None) -> "Simulator":
@@ -108,6 +159,20 @@ class Simulator:
         (Exposed for SEIR, Infected for SIS/SIR).
         """
         self._engine.seed_infection(num_infected, state)
+        return self
+
+    def set_initial_state(self, state, age=None) -> "Simulator":
+        """Set a complete initial condition and return ``self``.
+
+        Renewal engines accept optional node ages; Markovian engines reject an
+        age array because holding time is not part of their state.
+        """
+        if age is None:
+            self._engine.set_initial_state(state)
+        elif is_markovian(self.model):
+            raise ValueError("age is only valid for renewal/non-Markovian models")
+        else:
+            self._engine.set_initial_state(state, age)
         return self
 
     def step(self) -> float:
@@ -175,7 +240,7 @@ class Simulator:
            smaller window or an eager engine::
 
                fs.Simulator(g, m, steps_per_launch=2)     # tightest batched stop
-               fs.Simulator(g, m, use_cuda_graph=False)   # eager, exact
+               fs.Simulator(g, m, use_cuda_graph=False)   # one-step granularity
 
            The fused CUDA-Graph engine unrolls a double buffer, so it rounds an
            odd ``steps_per_launch`` **up to the next even number** -- asking for
@@ -187,9 +252,25 @@ class Simulator:
         """
         if seed is not None:
             seed_everything(seed)
+            if hasattr(self._engine, "reseed"):
+                self._engine.reseed(seed)
+
+        if not np.isfinite(until):
+            raise ValueError(f"until must be finite, got {until}")
+        if until < self.current_time:
+            raise ValueError(
+                f"until ({until}) is before current_time ({self.current_time})"
+            )
+        if not np.isfinite(record_every) or record_every <= 0.0:
+            raise ValueError(
+                f"record_every must be finite and positive, got {record_every}"
+            )
 
         names = tuple(state_names(self.model))
         inducers = tuple(int(s) for s in self.model.inducer_states)
+        susceptible = validate_compartment(
+            getattr(self.model, "susceptible", 0), len(names)
+        )
         times: list[float] = []
         rows: list[np.ndarray] = []
 
@@ -221,11 +302,12 @@ class Simulator:
             counts=np.vstack(rows).astype(np.int64),
             state_names=names,
             inducer_states=inducers,
-            num_nodes=int(self.graph.num_nodes),
+            num_nodes=self.num_nodes,
+            susceptible_state=susceptible,
         )
 
     def __repr__(self) -> str:
         kind = "markovian" if is_markovian(self.model) else "renewal"
         return (f"Simulator(engine={type(self._engine).__name__}, kind={kind}, "
-                f"device={self.device}, N={self.graph.num_nodes}, "
+                f"device={self.device}, N={self.num_nodes}, "
                 f"t={self.current_time:.3g})")

@@ -1,21 +1,24 @@
-"""
-Fused Renewal Engine using a single Triton kernel per step.
+"""IO-aware renewal engine built from two globally ordered Triton phases.
 
-This engine fuses CSR traversal, hazard computation, Bernoulli sampling,
-and state transitions into a single kernel launch, eliminating intermediate
-O(N) buffers from global memory. It uses the source-node compromise for
-non-Markovian edge transmission.
+The rate phase fuses susceptible-only CSR traversal with current-state hazard
+evaluation. A reduction then chooses that same step's adaptive ``tau`` before a
+shared transition kernel samples and renews ages. Age-dependent transmission
+also writes next infectivity; constant transmission derives it from state.
+This ordering enforces the epsilon contract while retaining one graph traversal
+and no dense infectivity pre-pass per step.
 
-Pipeline per step:
-1. Infectivity pre-pass (PyTorch elementwise, CUDA Graph safe)
-2. Fused FlashRenewal kernel (single Triton launch)
-3. Tau reduction for next step (lightweight max + divide)
+Age-dependent infectivity is bootstrapped once; constant transmission carries
+no per-node shedding buffer, and neither mode has a dense steady-state pre-pass.
+Captured execution ping-pongs buffers A->B->A, so an even replay window needs
+no full-array copy-back.
 """
 
 import math
+import operator
+from typing import Tuple
+import warnings
 
 import torch
-from typing import Tuple
 
 try:
     import triton
@@ -28,32 +31,48 @@ except Exception as _exc:  # noqa: BLE001 - keep import working without a GPU
     triton = None
     _TRITON_IMPORT_ERROR = _exc
 
-from ..core.graph import GraphCSR
+from ..core.graph import as_csr
+from ..core.host_rng import (
+    INITIAL_CONDITION_DOMAIN,
+    normalize_seed,
+    offset_seed,
+    project_seed,
+    signed_int64,
+)
 from ..core.flash_renewal_kernel import (
-    _flash_renewal_fused_kernel,
-    _flash_renewal_fused_wc_kernel,
+    _flash_renewal_rate_kernel,
+    _flash_renewal_rate_wc_kernel,
     _pressure_merge_kernel,
-    _flash_renewal_tail_kernel,
+    _flash_renewal_rate_from_pressure_kernel,
+    _flash_renewal_finalize_tau_kernel,
+    _flash_renewal_transition_kernel,
 )
 from ..models.hazards import lognormal_hazard_stable
+from ..utils import (
+    validate_compartment,
+    validate_initial_tensors,
+    validate_model_contract,
+    validate_population_count,
+    validate_fp32_control,
+)
 
 
-# Auto-dispatch thresholds on D_max / D_mean. See the "Dispatch
-# Strategy" paragraph in the paper's §5 for the empirical justification.
-# Ratios below _DISPATCH_WARP_RATIO mean the degree distribution is
-# essentially uniform -> keep the 1-thread-per-node kernel. Between
-# _DISPATCH_WARP_RATIO and _DISPATCH_MERGE_RATIO the warp-per-node
-# kernel pays off. Above _DISPATCH_MERGE_RATIO the intra-block load
-# imbalance of the warp kernel dominates and edge-partitioned
-# merge-based wins.
+# Auto-dispatch starting thresholds on D_max / D_mean. These values predate
+# the current globally ordered rate/reduction/transition pipeline and are
+# heuristics, not current performance claims. The production acceptance matrix
+# measures all three strategies so they can be re-tuned on each target GPU.
 _DISPATCH_WARP_RATIO = 4.0
 _DISPATCH_MERGE_RATIO = 50.0
 
 
 def _auto_csr_strategy(row_ptr: torch.Tensor, num_nodes: int) -> str:
     """Pick a CSR traversal strategy from the graph's degree heterogeneity."""
-    degrees = (row_ptr[1:] - row_ptr[:-1]).to(torch.float64)
-    d_mean = float(degrees.mean().item())
+    if num_nodes <= 0:
+        raise ValueError("fused renewal engines require a graph with at least one node")
+    # Keep the one construction-time temporary int32. Widening all N degrees
+    # to fp64 added 8*N avoidable bytes on the largest supported graphs.
+    degrees = row_ptr[1:] - row_ptr[:-1]
+    d_mean = float(row_ptr[-1].item()) / num_nodes
     d_max = float(degrees.max().item())
     if d_mean < 1e-12:
         return "thread"
@@ -69,10 +88,9 @@ class RenewalEngineFused:
     """
     Fused Triton kernel renewal engine with non-Markovian edges.
 
-    Combines the source-node compromise (infectivity pre-pass) with a
-    fully fused Triton kernel that performs CSR traversal, hazard
-    evaluation, Bernoulli sampling, and state transitions in a single
-    kernel launch.
+    Combines source-node infectivity with a rate/traversal kernel and a shared
+    transition kernel separated by the adaptive-tau reduction required for
+    current-rate correctness.
 
     Example:
         >>> from flashspread import SEIRModel, FixedDegreeGraph
@@ -97,7 +115,7 @@ class RenewalEngineFused:
         csr_strategy: str = "auto",
         nodes_per_block: int = 8,
         lanes_per_node: int = 32,
-        edges_per_merge_block: int = 4096,
+        edges_per_merge_block: int = 1024,
         # Deprecated: prefer csr_strategy="warp" over warp_collaborative=True.
         warp_collaborative: bool = False,
     ):
@@ -106,49 +124,158 @@ class RenewalEngineFused:
                 "Triton is required for RenewalEngineFused. Install the GPU "
                 "extra with `pip install flashspread[gpu]` on a CUDA machine."
             ) from _TRITON_IMPORT_ERROR
+        for name, value in {
+            "bf16_weights": bf16_weights,
+            "use_mixed_precision": use_mixed_precision,
+            "warp_collaborative": warp_collaborative,
+        }.items():
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a bool")
+        if warp_collaborative:
+            warnings.warn(
+                "warp_collaborative is deprecated; use csr_strategy='warp'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise RuntimeError("RenewalEngineFused requires a CUDA device")
         self.model = model
-        self.epsilon = float(epsilon)
-        self.tau_max = float(tau_max)
+        from ..config import supports_fused_renewal
+
+        if not supports_fused_renewal(model):
+            raise TypeError(
+                "RenewalEngineFused requires the exact, unmodified built-in "
+                "SEIRModel; custom models must use the reference backend"
+            )
+        _, model_inducers = validate_model_contract(
+            model,
+            markovian=False,
+            methods=("prepare", "compute_rates", "apply_transitions"),
+        )
+        self.epsilon = validate_fp32_control(
+            "epsilon", epsilon, positive=True
+        )
+        self.tau_max = validate_fp32_control(
+            "tau_max", tau_max, positive=True
+        )
+        required_model = (
+            "susceptible",
+            "exposed",
+            "infected",
+            "recovered",
+            "num_states",
+            "beta",
+            "prepare",
+        )
+        missing = [name for name in required_model if not hasattr(model, name)]
+        if missing:
+            raise TypeError(
+                "the fused backend requires an ordered SEIR-style model; "
+                f"missing {', '.join(missing)}"
+            )
+        raw_state_ids = (
+            model.susceptible,
+            model.exposed,
+            model.infected,
+            model.recovered,
+        )
+        if any(isinstance(value, bool) for value in raw_state_ids):
+            raise TypeError("fused SEIR state indices must be integers")
+        try:
+            state_ids = tuple(operator.index(value) for value in raw_state_ids)
+        except TypeError as exc:
+            raise TypeError("fused SEIR state indices must be integers") from exc
+        if len(set(state_ids)) != 4 or any(
+            value < 0 or value >= int(model.num_states) for value in state_ids
+        ):
+            raise ValueError(
+                "fused SEIR state indices must be distinct and lie within num_states"
+            )
+        if set(model_inducers) != {state_ids[2]}:
+            raise ValueError(
+                "the fused SEIR backend requires infected as its sole inducer state"
+            )
+        transmission_mode = getattr(model, "transmission_mode", "constant")
+        if transmission_mode not in ("constant", "age_dependent"):
+            raise ValueError(
+                "transmission_mode must be 'constant' or 'age_dependent'"
+            )
+        raw_beta = model.beta
+        if isinstance(raw_beta, torch.Tensor):
+            if raw_beta.numel() != 1:
+                raise TypeError("fused model beta must be a numeric scalar")
+            raw_beta = raw_beta.item()
+        # This mode is a kernel constexpr.  Freeze it at construction so
+        # storage and every compiled specialization obey the same contract.
+        self._transmission_age_dependent = transmission_mode == "age_dependent"
+        self._beta = validate_fp32_control(
+            "model.beta", raw_beta, nonnegative=True
+        )
 
         # Validate step-control parameters (epsilon<=0 -> tau collapses to
         # 0 and the simulation clock freezes).
-        if not (self.epsilon > 0.0):
+        if not math.isfinite(self.epsilon) or not (self.epsilon > 0.0):
             raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
-        if not (self.tau_max > 0.0):
+        if not math.isfinite(self.tau_max) or not (self.tau_max > 0.0):
             raise ValueError(f"tau_max must be > 0, got {self.tau_max}")
 
         # CSR-traversal strategy controls how the kernel iterates the
         # incoming-edge list:
-        #   "thread": 1 thread per node, scalar loop over neighbors.
-        #             Fastest for uniform-degree graphs (regular, ER).
-        #   "warp":   32 threads per node, chunked loop. Wins on
-        #             moderately heavy-tailed distributions; hub
-        #             traversal scales as O(D_max / 32) inside the
-        #             node's warp.
+        #   "thread": 1 thread per node, scalar loop over neighbors;
+        #             intended for uniform-degree graphs (regular, ER).
+        #   "warp":   32 threads per node, chunked loop; intended for
+        #             moderately heavy-tailed distributions. Hub traversal
+        #             scales as O(D_max / 32) inside the node's warp.
         #   "merge":  Edge-partitioned; each block processes a fixed
         #             chunk of edges, recovers the source node via
         #             binary search in row_ptr, and atomic-adds to a
         #             pressure buffer. Delivers perfect load balance
         #             on extremely heavy tails (scale-free with hubs).
         #   "auto":   Choose at construction time from D_max / D_mean.
-        self.nodes_per_block = int(nodes_per_block)
-        self.lanes_per_node = int(lanes_per_node)
-        self.edges_per_merge_block = int(edges_per_merge_block)
+        try:
+            self.nodes_per_block = operator.index(nodes_per_block)
+            self.lanes_per_node = operator.index(lanes_per_node)
+            self.edges_per_merge_block = operator.index(edges_per_merge_block)
+        except TypeError as exc:
+            raise TypeError("CSR traversal sizes must be integers") from exc
+        if any(
+            isinstance(value, bool)
+            for value in (nodes_per_block, lanes_per_node, edges_per_merge_block)
+        ):
+            raise TypeError("CSR traversal sizes must be integers, not bool")
+        if self.nodes_per_block <= 0 or self.nodes_per_block & (self.nodes_per_block - 1):
+            raise ValueError("nodes_per_block must be a positive power of two")
+        if (
+            self.lanes_per_node <= 0
+            or self.lanes_per_node > 32
+            or self.lanes_per_node & (self.lanes_per_node - 1)
+        ):
+            raise ValueError("lanes_per_node must be a power of two in [1, 32]")
+        if self.nodes_per_block * self.lanes_per_node > 1024:
+            raise ValueError("nodes_per_block * lanes_per_node must be <= 1024")
+        if (
+            self.edges_per_merge_block <= 0
+            or self.edges_per_merge_block & (self.edges_per_merge_block - 1)
+        ):
+            raise ValueError("edges_per_merge_block must be a positive power of two")
 
-        # Get graph data
-        if hasattr(graph, "csr"):
-            self.graph = graph.csr.to(self.device)
-        elif hasattr(graph, "row_ptr"):
-            self.graph = graph
-        else:
-            raise ValueError("graph must have csr or row_ptr attribute")
+        self.graph = as_csr(graph, self.device)
+        # GraphCSR resolves an unindexed ``cuda`` request to concrete storage
+        # (for example cuda:0). Retain that device so later context managers
+        # cannot follow a changed process-wide current device.
+        self.device = self.graph.row_ptr.device
 
         self.num_nodes = self.graph.num_nodes
+        if self.num_nodes <= 0:
+            raise ValueError("RenewalEngineFused requires a non-empty graph")
 
-        # Mixed-precision storage: state int8, age fp16, infectivity
-        # bf16 (accumulator stays fp32 inside the kernel). Auto-enables
+        # Mixed storage: state int8 and age-dependent infectivity bf16 while
+        # age remains fp32 (accumulator/math also fp32). Storing age in fp16
+        # can round age + tau back to the same value on high-rate hubs, freezing
+        # renewal clocks while simulation time advances, so it is deliberately
+        # excluded from the compact path. Mixed mode auto-enables
         # bf16 weights so the whole CSR traversal runs in reduced
         # precision; the kernel promotes every load to fp32/int32
         # before any arithmetic via the MIXED_PRECISION constexpr.
@@ -158,6 +285,7 @@ class RenewalEngineFused:
 
         if bf16_weights and hasattr(self.graph, 'to_bf16_weights'):
             self.graph = self.graph.to_bf16_weights()
+        self._graph_signature = self.graph._mutation_signature()
 
         # Prepare model parameters on device
         if hasattr(self.model, "prepare"):
@@ -165,14 +293,15 @@ class RenewalEngineFused:
 
         # State tensors (read/write by fused kernel).
         # Dtypes: baseline uses int32/fp32 for state/age/infectivity;
-        # mixed-precision mode (use_mixed_precision=True) drops these
-        # to int8/fp16/bf16. The kernel's MIXED_PRECISION constexpr
+        # mixed-storage mode drops state/infectivity to int8/bf16 and retains
+        # fp32 age. The kernel's MIXED_PRECISION constexpr
         # path handles the promote-on-load / cast-on-store contract;
         # the accumulator (pressure) and all math intermediates are
         # always fp32.
-        _state_dt  = torch.int8      if self._use_mixed_precision else torch.int32
-        _age_dt    = torch.float16   if self._use_mixed_precision else torch.float32
-        _inf_dt    = torch.bfloat16  if self._use_mixed_precision else torch.float32
+        _state_dt = torch.int8 if self._use_mixed_precision else torch.int32
+        _age_dt = torch.float32
+        _inf_dt = torch.bfloat16 if self._use_mixed_precision else torch.float32
+        self._inf_dtype = _inf_dt
         self.state = torch.zeros(self.num_nodes, device=self.device, dtype=_state_dt)
         self.age = torch.zeros(self.num_nodes, device=self.device, dtype=_age_dt)
 
@@ -180,22 +309,34 @@ class RenewalEngineFused:
         self.next_state = torch.zeros(self.num_nodes, device=self.device, dtype=_state_dt)
         self.next_age = torch.zeros(self.num_nodes, device=self.device, dtype=_age_dt)
 
-        # Infectivity is now double-buffered and written inside the fused
-        # kernel. The dense Python pre-pass only runs once, at bootstrap,
-        # to populate `infectivity` from the user's initial seed.
-        self.infectivity = torch.zeros(self.num_nodes, device=self.device, dtype=_inf_dt)
-        self.next_infectivity = torch.zeros(self.num_nodes, device=self.device, dtype=_inf_dt)
+        # Age-dependent shedding needs a gathered per-node payload.  Constant
+        # transmission gathers source state and beta directly, so two scalar
+        # dummies preserve one static kernel signature without carrying or
+        # writing 2*N redundant infectivity values.
+        infectivity_size = self.num_nodes if self._transmission_age_dependent else 1
+        self._infectivity = torch.zeros(
+            infectivity_size, device=self.device, dtype=_inf_dt
+        )
+        self._next_infectivity = torch.zeros_like(self._infectivity)
 
-        # Rates buffer (written by fused kernel for tau reduction)
+        # Rates are the sole O(N) intermediate. A global barrier between their
+        # production and transition sampling is required for a correct adaptive
+        # step; all traversal pressure stays in registers.
         self.rates = torch.zeros(self.num_nodes, device=self.device, dtype=torch.float32)
 
         # Resolve CSR strategy now that row_ptr is available.
-        strategy = str(csr_strategy).lower()
-        if strategy == "auto":
-            strategy = _auto_csr_strategy(self.graph.row_ptr, self.num_nodes)
-        if warp_collaborative and strategy == "thread":
-            # Backwards-compatible: legacy kwarg forces warp-per-node.
+        requested_strategy = str(csr_strategy).lower()
+        if warp_collaborative and requested_strategy not in ("auto", "thread", "warp"):
+            raise ValueError(
+                "warp_collaborative=True conflicts with "
+                f"csr_strategy={csr_strategy!r}"
+            )
+        if warp_collaborative:
             strategy = "warp"
+        elif requested_strategy == "auto":
+            strategy = _auto_csr_strategy(self.graph.row_ptr, self.num_nodes)
+        else:
+            strategy = requested_strategy
         if strategy not in ("thread", "warp", "merge"):
             raise ValueError(
                 f"csr_strategy must be one of 'auto'/'thread'/'warp'/'merge'; "
@@ -205,21 +346,10 @@ class RenewalEngineFused:
         # Legacy flag (some benchmarks still read it).
         self.warp_collaborative = strategy == "warp"
 
-        # Mixed-precision is wired into the thread-path fused kernel
-        # AND into the merge-path (pressure atomic + tail kernel).
-        # The warp-per-node kernel does NOT yet carry the
-        # MIXED_PRECISION constexpr, so reject that combination
-        # rather than silently produce garbage. Merge is safe because
-        # the merge pressure scratch buffer stays fp32 regardless:
-        # the atomic-add accumulation of hundreds of bf16 edge
-        # contributions on a scale-free hub would otherwise absorb
-        # small values and poison the Bernoulli draw.
-        if self._use_mixed_precision and strategy == "warp":
-            raise ValueError(
-                "use_mixed_precision=True is not yet supported with "
-                "csr_strategy='warp'. Use 'thread' or 'merge' (both "
-                "are fully mixed-precision), or disable the flag."
-            )
+        # All traversal strategies promote compact state/age/infectivity and
+        # weights before arithmetic. Thread/warp pressure stays in registers;
+        # merge uses an explicit fp32 scratch array so hub atomics do not
+        # absorb small bf16 contributions.
 
         if strategy == "merge":
             # The merge kernel needs a scratch pressure buffer and an
@@ -239,10 +369,18 @@ class RenewalEngineFused:
             self._bsearch_iters = 0
             self._num_edges = 0
 
-        # Tau: use previous step's value. First step uses tau_max.
+        # Current-step tau, computed from current-state rates before sampling.
         self.tau = torch.tensor([self.tau_max], device=self.device, dtype=torch.float32)
-        self.epsilon_t = torch.tensor(self.epsilon, device=self.device, dtype=torch.float32)
-        self.tau_max_t = torch.tensor(self.tau_max, device=self.device, dtype=torch.float32)
+        self._max_rate = torch.zeros((), device=self.device, dtype=torch.float32)
+        rate_nodes_per_program = (
+            self.nodes_per_block if self.csr_strategy == "warp" else 128
+        )
+        self._max_rate_partials = torch.zeros(
+            (self.num_nodes + rate_nodes_per_program - 1)
+            // rate_nodes_per_program,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         # Active-node compaction buffers. Base engine never compacts, but
         # the fused kernel signature now takes these pointers so we
@@ -256,25 +394,27 @@ class RenewalEngineFused:
             [self.num_nodes], device=self.device, dtype=torch.int32
         )
 
-        # RNG: step_id increments by 1 per step, used as seed perturbation.
-        # Safe for 2^31 steps (>2 billion) without int32 overflow in kernel.
-        self._base_seed = int(seed)
-        self._rng_seed = int(seed)
+        # RNG: a 64-bit base seed and step counter are mixed into each step key.
+        self._base_seed = normalize_seed(seed)
+        # Device-resident so CUDA Graph replay observes reset(episode=...)
+        # without recapture. Passing a Python int bakes the seed into capture.
+        self._rng_seed = torch.tensor(
+            [signed_int64(self._base_seed)], device=self.device, dtype=torch.int64
+        )
         self._step_id = torch.zeros(1, device=self.device, dtype=torch.int64)
 
         # Dedicated generator for reproducible initial-condition sampling.
         self._init_gen = torch.Generator(device=self.device)
-        self._init_gen.manual_seed(self._base_seed)
+        self._init_gen.manual_seed(
+            project_seed(self._base_seed, INITIAL_CONDITION_DOMAIN)
+        )
 
         # Simulation state
         self.current_time = 0.0
         self.total_steps = 0
 
         # SEIR state indices
-        self._state_s = model.susceptible
-        self._state_e = model.exposed
-        self._state_i = model.infected
-        self._state_r = model.recovered
+        self._state_s, self._state_e, self._state_i, self._state_r = state_ids
 
         # Model parameters (on device)
         self._mu_ei = None
@@ -283,20 +423,62 @@ class RenewalEngineFused:
         self._sig_ir = None
         self._prepare_model_params()
 
-        # Transmission mode is a kernel constexpr, baked in at first JIT.
-        # Changing model.transmission_mode after engine construction will
-        # not take effect until a new engine is created.
-        self._transmission_age_dependent = (
-            getattr(self.model, "transmission_mode", "constant") == "age_dependent"
+    def _constant_infectivity_snapshot(self, state: torch.Tensor) -> torch.Tensor:
+        """Materialize constant shedding only for diagnostic compatibility."""
+        return torch.where(state == self._state_i, self._beta, 0.0).to(
+            dtype=self._inf_dtype
         )
-        self._beta = float(self.model.beta)
+
+    @property
+    def infectivity(self) -> torch.Tensor:
+        """Current shedding values; constant-mode values are a derived snapshot."""
+        if self._transmission_age_dependent:
+            return self._infectivity
+        return self._constant_infectivity_snapshot(self.state)
+
+    @property
+    def next_infectivity(self) -> torch.Tensor:
+        """Alternate shedding values; constant-mode values are derived on access."""
+        if self._transmission_age_dependent:
+            return self._next_infectivity
+        return self._constant_infectivity_snapshot(self.next_state)
+
+    def reseed(self, seed: int) -> None:
+        """Reseed device-visible transition and initial-condition streams."""
+        self._base_seed = normalize_seed(seed)
+        self._rng_seed.fill_(signed_int64(self._base_seed))
+        self._step_id.zero_()
+        self._init_gen.manual_seed(
+            project_seed(self._base_seed, INITIAL_CONDITION_DOMAIN)
+        )
 
     def _prepare_model_params(self):
         """Extract lognormal parameters from model."""
-        self._mu_ei = float(self.model._mu_ei.item())
-        self._sig_ei = float(self.model._sig_ei.item())
-        self._mu_ir = float(self.model._mu_ir.item())
-        self._sig_ir = float(self.model._sig_ir.item())
+        names = ("_mu_ei", "_sig_ei", "_mu_ir", "_sig_ir")
+        missing = [name for name in names if not hasattr(self.model, name)]
+        if missing:
+            raise TypeError(
+                "the fused backend requires prepared log-normal parameters; "
+                f"missing {', '.join(missing)}"
+            )
+        values = {}
+        for name in names:
+            raw = getattr(self.model, name)
+            if isinstance(raw, torch.Tensor):
+                if raw.numel() != 1:
+                    raise TypeError(
+                        f"prepared fused parameter {name} must be a scalar"
+                    )
+                raw = raw.item()
+            values[name] = validate_fp32_control(
+                f"model.{name}",
+                raw,
+                positive=name.startswith("_sig"),
+            )
+        self._mu_ei = values["_mu_ei"]
+        self._sig_ei = values["_sig_ei"]
+        self._mu_ir = values["_mu_ir"]
+        self._sig_ir = values["_sig_ir"]
 
     def reset(self, episode: int | None = None) -> None:
         """Reset all simulation state for clean re-use (e.g., RL episodes).
@@ -306,19 +488,21 @@ class RenewalEngineFused:
                 so successive episodes are statistically independent.
                 Otherwise reset to the base seed (reproduces the first run).
 
-        Note:
-            For the CUDA-Graph subclass the per-step seed is baked into the
-            captured graph, so changing ``episode`` only affects the
-            initial-condition draw, not the in-graph step RNG. Reconstruct
-            the engine if you need a fresh in-graph stream per episode.
         """
+        eff_seed = offset_seed(
+            self._base_seed,
+            episode if episode is not None else 0,
+            name="episode",
+        )
         self.state.zero_()
         self.age.zero_()
         self.next_state.zero_()
         self.next_age.zero_()
-        self.infectivity.zero_()
-        self.next_infectivity.zero_()
+        self._infectivity.zero_()
+        self._next_infectivity.zero_()
         self.rates.zero_()
+        self._max_rate.zero_()
+        self._max_rate_partials.zero_()
         if self._pressure_scratch is not None:
             self._pressure_scratch.zero_()
         self.tau.fill_(self.tau_max)
@@ -326,18 +510,17 @@ class RenewalEngineFused:
         self.current_time = 0.0
         self.total_steps = 0
 
-        eff_seed = self._base_seed + (int(episode) if episode is not None else 0)
-        self._rng_seed = eff_seed
-        self._init_gen.manual_seed(eff_seed)
+        self._rng_seed.fill_(signed_int64(eff_seed))
+        self._init_gen.manual_seed(
+            project_seed(eff_seed, INITIAL_CONDITION_DOMAIN)
+        )
 
     def seed_infection(self, num_infected: int, state: int = None) -> None:
         """Randomly seed initial infections."""
         if state is None:
             state = self._state_e  # default: Exposed for SEIR
-        if not (0 <= num_infected <= self.num_nodes):
-            raise ValueError(
-                f"num_infected must be in [0, {self.num_nodes}], got {num_infected}"
-            )
+        state = validate_compartment(state, self.model.num_states)
+        num_infected = validate_population_count(num_infected, self.num_nodes)
         indices = torch.randperm(
             self.num_nodes, device=self.device, generator=self._init_gen
         )[:num_infected]
@@ -348,164 +531,253 @@ class RenewalEngineFused:
         # in-kernel.
         self._infectivity_prepass()
 
+    def set_initial_state(
+        self,
+        initial_state: torch.Tensor,
+        initial_age: torch.Tensor | None = None,
+    ) -> None:
+        """Initialize state/ages and bootstrap first-step infectivity."""
+        state, age = validate_initial_tensors(
+            initial_state,
+            num_nodes=self.num_nodes,
+            num_states=self.model.num_states,
+            device=self.device,
+            initial_age=initial_age,
+        )
+        self.state.copy_(state)
+        if age is None:
+            self.age.zero_()
+        else:
+            self.age.copy_(age)
+        self._infectivity_prepass()
+        # Keep both sides of the captured ping-pong coherent. In particular,
+        # recovered nodes may be omitted by the compacted rate pass; a stale
+        # infectious value in the alternate buffer would create phantom pressure.
+        self.next_state.copy_(self.state)
+        self.next_age.copy_(self.age)
+        if self._transmission_age_dependent:
+            self._next_infectivity.copy_(self._infectivity)
+
     def _infectivity_prepass(self):
         """Compute infectivity based on model's transmission_mode."""
         i_mask = self.state == self._state_i
 
-        if getattr(self.model, 'transmission_mode', 'constant') == 'age_dependent':
+        if self._transmission_age_dependent:
             hazard_all = lognormal_hazard_stable(
                 torch.clamp(self.age, min=1e-10),
                 self.model._mu_ir,
                 self.model._sig_ir,
             )
-            self.infectivity.copy_(
+            self._infectivity.copy_(
                 torch.where(i_mask, self.model._beta_t * hazard_all, 0.0)
             )
         else:
-            # Constant beta: matches original RenewalEngine semantics
-            self.infectivity.copy_(
-                torch.where(i_mask, self.model._beta_t, 0.0)
-            )
+            # The rate kernel gathers source state and applies beta directly.
+            self._infectivity.zero_()
 
-    def _compute_tau(self):
-        """Compute adaptive tau from rates written by fused kernel."""
-        max_rate = self.rates.max()
-        tau_candidate = self.epsilon_t / (max_rate + 1e-12)
-        tau = torch.minimum(tau_candidate, self.tau_max_t)
-        tau = torch.where(max_rate < 1e-9, self.tau_max_t, tau)
-        self.tau.copy_(tau)
+    def _compute_tau(self, *, elapsed_ptr: torch.Tensor | None = None) -> None:
+        """Choose current tau and advance step metadata in two GPU nodes.
 
-    def _step_impl(self):
-        """Execute one fused step."""
-        # The infectivity pre-pass no longer runs per step; the fused
-        # kernel writes next_infectivity from new_state / new_age.
+        A global max is the required ordering barrier after rate evaluation.
+        Each rate program has already emitted one maximum, so this reduction
+        reads only the compact partial array instead of rereading all public
+        rates. One scalar Triton program then performs all remaining tau
+        arithmetic, advances the device RNG step id, and optionally accumulates
+        CUDA-Graph replay time.
+        """
+        torch.max(self._max_rate_partials, out=self._max_rate)
+        _flash_renewal_finalize_tau_kernel[(1,)](
+            max_rate_ptr=self._max_rate,
+            tau_ptr=self.tau,
+            # Compile-time dead when elapsed_ptr is omitted; reusing tau avoids
+            # carrying another dummy tensor in the eager engine.
+            elapsed_ptr=self.tau if elapsed_ptr is None else elapsed_ptr,
+            step_id_ptr=self._step_id,
+            epsilon=self.epsilon,
+            tau_max=self.tau_max,
+            ACCUMULATE_TIME=1 if elapsed_ptr is not None else 0,
+        )
 
-        # Increment step_id by 1 (CUDA Graph safe, no int32 overflow risk)
-        self._step_id.add_(1)
+    def _launch_rates(
+        self,
+        state,
+        age,
+        infectivity,
+        *,
+        use_compaction: bool,
+    ) -> None:
+        """Fuse one configured graph traversal with current-rate evaluation.
 
+        Binding the traversal strategy at construction keeps the hot kernels
+        specialized, while this one host dispatcher is shared by eager and
+        captured execution.
+        """
         if self.csr_strategy == "merge":
-            # Zero the pressure scratch, accumulate via atomics, then
-            # run the tail kernel.
             self._pressure_scratch.zero_()
-
-            merge_grid = lambda meta: (
-                triton.cdiv(self._num_edges, meta["EDGES_PER_BLOCK"]),
-            )
-            _pressure_merge_kernel[merge_grid](
-                row_ptr_ptr=self.graph.row_ptr,
-                col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                infectivity_ptr=self.infectivity,
-                pressure_ptr=self._pressure_scratch,
-                N=self.num_nodes,
-                E=self._num_edges,
-                EDGES_PER_BLOCK=self.edges_per_merge_block,
-                BSEARCH_ITERS=self._bsearch_iters,
-            )
+            if self._num_edges:
+                merge_grid = (
+                    triton.cdiv(self._num_edges, self.edges_per_merge_block),
+                )
+                _pressure_merge_kernel[merge_grid](
+                    row_ptr_ptr=self.graph.row_ptr,
+                    col_ind_ptr=self.graph.col_ind,
+                    weights_ptr=self.graph.weights_storage,
+                    infectivity_ptr=infectivity,
+                    state_ptr=state,
+                    pressure_ptr=self._pressure_scratch,
+                    beta=self._beta,
+                    N=self.num_nodes,
+                    E=self._num_edges,
+                    STATE_S=self._state_s,
+                    STATE_I=self._state_i,
+                    HAS_WEIGHTS=self.graph.has_weights,
+                    TRANSMISSION_AGE_DEPENDENT=(
+                        1 if self._transmission_age_dependent else 0
+                    ),
+                    EDGES_PER_BLOCK=self.edges_per_merge_block,
+                    BSEARCH_ITERS=self._bsearch_iters,
+                )
 
             BLOCK_SIZE = 128
-            tail_grid = lambda meta: (
-                triton.cdiv(self.num_nodes, meta["BLOCK_SIZE"]),
-            )
-            _flash_renewal_tail_kernel[tail_grid](
+            grid = (triton.cdiv(self.num_nodes, BLOCK_SIZE),)
+            _flash_renewal_rate_from_pressure_kernel[grid](
                 pressure_ptr=self._pressure_scratch,
-                age_ptr=self.age,
-                state_ptr=self.state,
-                beta=self._beta,
+                age_ptr=age,
+                state_ptr=state,
                 mu_ei=self._mu_ei,
                 sig_ei=self._sig_ei,
                 mu_ir=self._mu_ir,
                 sig_ir=self._sig_ir,
-                tau_ptr=self.tau,
-                rng_seed=self._rng_seed,
-                step_id_ptr=self._step_id,
-                next_state_ptr=self.next_state,
-                next_age_ptr=self.next_age,
-                next_infectivity_ptr=self.next_infectivity,
                 rates_ptr=self.rates,
+                max_rate_partials_ptr=self._max_rate_partials,
                 N=self.num_nodes,
                 STATE_S=self._state_s,
                 STATE_E=self._state_e,
                 STATE_I=self._state_i,
-                STATE_R=self._state_r,
                 BLOCK_SIZE=BLOCK_SIZE,
-                TRANSMISSION_AGE_DEPENDENT=1 if self._transmission_age_dependent else 0,
-                MIXED_PRECISION=1 if self._use_mixed_precision else 0,
             )
         elif self.csr_strategy == "warp":
-            grid = lambda meta: (
-                triton.cdiv(self.num_nodes, meta["NODES_PER_BLOCK"]),
-            )
-            _flash_renewal_fused_wc_kernel[grid](
+            grid = (triton.cdiv(self.num_nodes, self.nodes_per_block),)
+            _flash_renewal_rate_wc_kernel[grid](
                 row_ptr_ptr=self.graph.row_ptr,
                 col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                infectivity_ptr=self.infectivity,
-                age_ptr=self.age,
-                state_ptr=self.state,
+                weights_ptr=self.graph.weights_storage,
+                infectivity_ptr=infectivity,
+                age_ptr=age,
+                state_ptr=state,
                 beta=self._beta,
                 mu_ei=self._mu_ei,
                 sig_ei=self._sig_ei,
                 mu_ir=self._mu_ir,
                 sig_ir=self._sig_ir,
-                tau_ptr=self.tau,
-                rng_seed=self._rng_seed,
-                step_id_ptr=self._step_id,
-                next_state_ptr=self.next_state,
-                next_age_ptr=self.next_age,
-                next_infectivity_ptr=self.next_infectivity,
                 rates_ptr=self.rates,
+                max_rate_partials_ptr=self._max_rate_partials,
                 N=self.num_nodes,
                 STATE_S=self._state_s,
                 STATE_E=self._state_e,
                 STATE_I=self._state_i,
-                STATE_R=self._state_r,
                 NODES_PER_BLOCK=self.nodes_per_block,
                 LANES_PER_NODE=self.lanes_per_node,
-                TRANSMISSION_AGE_DEPENDENT=1 if self._transmission_age_dependent else 0,
+                HAS_WEIGHTS=self.graph.has_weights,
+                TRANSMISSION_AGE_DEPENDENT=(
+                    1 if self._transmission_age_dependent else 0
+                ),
             )
         else:
             BLOCK_SIZE = 128
-            grid = lambda meta: (triton.cdiv(self.num_nodes, meta["BLOCK_SIZE"]),)
-            _flash_renewal_fused_kernel[grid](
+            grid = (triton.cdiv(self.num_nodes, BLOCK_SIZE),)
+            _flash_renewal_rate_kernel[grid](
                 row_ptr_ptr=self.graph.row_ptr,
                 col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                infectivity_ptr=self.infectivity,
-                age_ptr=self.age,
-                state_ptr=self.state,
+                weights_ptr=self.graph.weights_storage,
+                infectivity_ptr=infectivity,
+                age_ptr=age,
+                state_ptr=state,
                 beta=self._beta,
                 mu_ei=self._mu_ei,
                 sig_ei=self._sig_ei,
                 mu_ir=self._mu_ir,
                 sig_ir=self._sig_ir,
-                tau_ptr=self.tau,
-                rng_seed=self._rng_seed,
-                step_id_ptr=self._step_id,
-                next_state_ptr=self.next_state,
-                next_age_ptr=self.next_age,
-                next_infectivity_ptr=self.next_infectivity,
                 rates_ptr=self.rates,
+                max_rate_partials_ptr=self._max_rate_partials,
                 active_nodes_ptr=self._active_nodes_dummy,
                 num_active_ptr=self._num_active_dummy,
                 N=self.num_nodes,
                 STATE_S=self._state_s,
                 STATE_E=self._state_e,
                 STATE_I=self._state_i,
-                STATE_R=self._state_r,
+                HAS_WEIGHTS=self.graph.has_weights,
+                TRANSMISSION_AGE_DEPENDENT=(
+                    1 if self._transmission_age_dependent else 0
+                ),
+                USE_COMPACTION=1 if use_compaction else 0,
                 BLOCK_SIZE=BLOCK_SIZE,
-                TRANSMISSION_AGE_DEPENDENT=1 if self._transmission_age_dependent else 0,
-                USE_COMPACTION=0,
-                MIXED_PRECISION=1 if self._use_mixed_precision else 0,
             )
+
+    def _launch_transition(
+        self,
+        state,
+        age,
+        next_state,
+        next_age,
+        next_infectivity,
+    ) -> None:
+        """Sample current rates and write a complete next-node buffer."""
+        BLOCK_SIZE = 128
+        grid = (triton.cdiv(self.num_nodes, BLOCK_SIZE),)
+        _flash_renewal_transition_kernel[grid](
+            age_ptr=age,
+            state_ptr=state,
+            rates_ptr=self.rates,
+            beta=self._beta,
+            mu_ir=self._mu_ir,
+            sig_ir=self._sig_ir,
+            tau_ptr=self.tau,
+            rng_seed_ptr=self._rng_seed,
+            step_id_ptr=self._step_id,
+            next_state_ptr=next_state,
+            next_age_ptr=next_age,
+            next_infectivity_ptr=next_infectivity,
+            N=self.num_nodes,
+            STATE_S=self._state_s,
+            STATE_E=self._state_e,
+            STATE_I=self._state_i,
+            STATE_R=self._state_r,
+            TRANSMISSION_AGE_DEPENDENT=(
+                1 if self._transmission_age_dependent else 0
+            ),
+            MIXED_PRECISION=1 if self._use_mixed_precision else 0,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+    def _step_impl(self) -> torch.Tensor:
+        """Execute one eager, current-rate adaptive step."""
+        self.graph._assert_unchanged(
+            self._graph_signature, owner=type(self).__name__
+        )
+        self._launch_rates(
+            self.state,
+            self.age,
+            self._infectivity,
+            use_compaction=False,
+        )
+        self._compute_tau()
+        self._launch_transition(
+            self.state,
+            self.age,
+            self.next_state,
+            self.next_age,
+            self._next_infectivity,
+        )
 
         # Swap buffers (pointer swap for eager — zero overhead)
         self.state, self.next_state = self.next_state, self.state
         self.age, self.next_age = self.next_age, self.age
-        self.infectivity, self.next_infectivity = self.next_infectivity, self.infectivity
-
-        # Step 3: Compute tau for next step from rates
-        self._compute_tau()
+        self._infectivity, self._next_infectivity = (
+            self._next_infectivity,
+            self._infectivity,
+        )
+        return self.tau
 
     def step(self) -> Tuple[float, torch.Tensor]:
         """
@@ -514,11 +786,16 @@ class RenewalEngineFused:
         Returns:
             Tuple of (elapsed_time, current_state).
         """
-        tau_before = float(self.tau.item())
-        self._step_impl()
-        self.current_time += tau_before
+        with torch.cuda.device(self.device):
+            tau = float(self._step_impl().item())
+        if not math.isfinite(tau) or tau <= 0.0:
+            raise FloatingPointError(
+                "Fused renewal tau is non-finite or non-positive; check model "
+                "parameters, edge weights, ages, and aggregate weighted degree"
+            )
+        self.current_time += tau
         self.total_steps += 1
-        return tau_before, self.state
+        return tau, self.state
 
     def simulate_until(self, target_time: float) -> None:
         """Simulate until target time is reached."""
@@ -538,11 +815,10 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
     """
     CUDA Graph optimized version of fused renewal engine.
 
-    Captures the full pipeline (infectivity pre-pass + fused Triton kernel
-    + tau reduction) as a CUDA Graph for maximum throughput.
+    Captures rate evaluation, tau reduction, and transition as a CUDA Graph.
 
-    State is snapshot/restored around graph capture so that the simulation
-    starts exactly where the user expects (no "time travel" from warmup).
+    Construction-time warmup state is reset after graph capture so the first
+    user-supplied initial condition starts from a clean RNG and buffer state.
     """
 
     def __init__(
@@ -552,26 +828,38 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
         use_active_compaction: bool = False,
         **kwargs,
     ):
+        if not isinstance(use_active_compaction, bool):
+            raise TypeError("use_active_compaction must be a bool")
         super().__init__(*args, **kwargs)
 
-        if self.device.type != "cuda":
-            raise RuntimeError("RenewalEngineFusedCUDAGraph requires CUDA device")
-
         # Force even steps_per_launch for double-buffer unrolling
-        self.steps_per_launch = int(steps_per_launch)
+        if isinstance(steps_per_launch, bool):
+            raise TypeError("steps_per_launch must be an integer, not bool")
+        try:
+            self.steps_per_launch = operator.index(steps_per_launch)
+        except TypeError as exc:
+            raise TypeError("steps_per_launch must be an integer") from exc
+        if self.steps_per_launch <= 0:
+            raise ValueError(
+                f"steps_per_launch must be positive, got {self.steps_per_launch}"
+            )
         if self.steps_per_launch % 2 != 0:
             self.steps_per_launch += 1
+        if self.steps_per_launch * self.tau_max > torch.finfo(torch.float64).max:
+            raise ValueError(
+                "rounded steps_per_launch * tau_max must fit in the fp64 "
+                "CUDA Graph elapsed-time accumulator"
+            )
 
         self.step_time_accumulator = torch.zeros(
-            1, device=self.device, dtype=torch.float32
+            1, device=self.device, dtype=torch.float64
         )
 
         # --------------------------------------------------------------
         # Active-node compaction (Fixed-Grid, Early-Exit pattern)
         # --------------------------------------------------------------
-        # Goal: drop the fused kernel's per-step footprint from O(N)
-        # blocks to O(|state != R|) blocks, recovering the back-end of
-        # the epidemic where R dominates.
+        # Goal: mask node work and memory operations for recovered nodes,
+        # recovering the back-end of the epidemic where R dominates.
         #
         # Predicate is "state != R", NOT "state in E ∪ I": FlashSpread
         # uses a pull-based CSR gather, so S nodes must also evaluate
@@ -603,30 +891,33 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
                 "engine or set use_active_compaction=False for this graph."
             )
 
-        # Pre-allocated static buffers. We size the active-nodes
-        # buffer to (N + BLOCK_SIZE) so that the fused kernel's last
-        # thread block can safely issue a masked load at offsets
-        # near N without touching unmapped memory; the tail positions
-        # are initialised to 0 so any stray (mask-gated) read returns
-        # a deterministic value rather than whatever the allocator
-        # happened to leave there. BLOCK_SIZE=128 is the current fused
-        # kernel block size; keep in sync if that ever changes.
-        _SAFE_PAD = 128
-        self._active_nodes_buffer = torch.zeros(
-            self.num_nodes + _SAFE_PAD, device=self.device, dtype=torch.int32
-        )
-        self._active_nodes_buffer[: self.num_nodes] = torch.arange(
-            self.num_nodes, device=self.device, dtype=torch.int32
-        )
-        self._num_active_device = torch.tensor(
-            [self.num_nodes], device=self.device, dtype=torch.int32
-        )
-        # Expose the buffers so the fused-kernel call sites in the
-        # inherited base class also see non-dummy pointers. This lets
-        # the non-compacting path continue to pass them (with
-        # USE_COMPACTION=0 the kernel never reads them).
-        self._active_nodes_dummy = self._active_nodes_buffer
-        self._num_active_dummy = self._num_active_device
+        self._active_nodes_buffer = None
+        self._num_active_device = None
+        if self._use_active_compaction:
+            # Size the active-node buffer to N + BLOCK_SIZE so the last fused
+            # block can issue a masked load without touching unmapped memory.
+            # The base class's two scalar dummies remain in place when
+            # compaction is off; allocating this array unconditionally used to
+            # waste 4*N persistent bytes on the default path.
+            _SAFE_PAD = 128
+            self._active_nodes_buffer = torch.zeros(
+                self.num_nodes + _SAFE_PAD,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            # Write directly into the static buffer instead of constructing a
+            # second N-element arange allocation during engine startup.
+            torch.arange(
+                self.num_nodes,
+                device=self.device,
+                dtype=torch.int32,
+                out=self._active_nodes_buffer[: self.num_nodes],
+            )
+            self._num_active_device = torch.tensor(
+                [self.num_nodes], device=self.device, dtype=torch.int32
+            )
+            self._active_nodes_dummy = self._active_nodes_buffer
+            self._num_active_dummy = self._num_active_device
 
         self.graph_exec = None
         self._capture_graph()
@@ -634,210 +925,140 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
     def _refresh_active_set(self) -> None:
         """Rebuild the active-node list (state != R) into the static buffer.
 
-        Triggers exactly one D2H sync (for .numel()) per CUDA Graph
-        replay window; the actual index gather stays on-device via
-        torch.nonzero. In-place copy preserves the underlying pointer
-        so the captured kernel keeps using the same address.
+        ``torch.nonzero`` determines a dynamic output shape and therefore
+        triggers one D2H synchronization per CUDA Graph replay window. The
+        index gather and in-place copy stay on-device, preserving the pointer
+        captured by the graph.
         """
         if not self._use_active_compaction:
             return
         active_idx = torch.nonzero(
             self.state != self._state_r, as_tuple=False
         ).squeeze(-1).to(torch.int32)
-        num = int(active_idx.numel())  # 1 D2H sync per refresh
+        num = int(active_idx.numel())
         if num > 0:
             self._active_nodes_buffer[:num].copy_(active_idx)
         self._num_active_device.fill_(num)
 
-    def _static_step_forward(self) -> None:
-        """Step: state/age/infectivity -> next_* (+ copy back for CG)."""
-        self.step_time_accumulator.add_(self.tau)
-        # No more pre-pass inside the captured graph: the fused kernel
-        # writes next_infectivity itself, and the initial infectivity
-        # value is populated once in seed_infection() BEFORE capture.
-        self._step_id.add_(1)
-
-        if self.csr_strategy == "merge":
-            self._pressure_scratch.zero_()
-
-            merge_grid = lambda meta: (
-                triton.cdiv(self._num_edges, meta["EDGES_PER_BLOCK"]),
-            )
-            _pressure_merge_kernel[merge_grid](
-                row_ptr_ptr=self.graph.row_ptr,
-                col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                infectivity_ptr=self.infectivity,
-                pressure_ptr=self._pressure_scratch,
-                N=self.num_nodes,
-                E=self._num_edges,
-                EDGES_PER_BLOCK=self.edges_per_merge_block,
-                BSEARCH_ITERS=self._bsearch_iters,
-            )
-
-            BLOCK_SIZE = 128
-            tail_grid = lambda meta: (
-                triton.cdiv(self.num_nodes, meta["BLOCK_SIZE"]),
-            )
-            _flash_renewal_tail_kernel[tail_grid](
-                pressure_ptr=self._pressure_scratch,
-                age_ptr=self.age,
-                state_ptr=self.state,
-                beta=self._beta,
-                mu_ei=self._mu_ei,
-                sig_ei=self._sig_ei,
-                mu_ir=self._mu_ir,
-                sig_ir=self._sig_ir,
-                tau_ptr=self.tau,
-                rng_seed=self._rng_seed,
-                step_id_ptr=self._step_id,
-                next_state_ptr=self.next_state,
-                next_age_ptr=self.next_age,
-                next_infectivity_ptr=self.next_infectivity,
-                rates_ptr=self.rates,
-                N=self.num_nodes,
-                STATE_S=self._state_s,
-                STATE_E=self._state_e,
-                STATE_I=self._state_i,
-                STATE_R=self._state_r,
-                BLOCK_SIZE=BLOCK_SIZE,
-                TRANSMISSION_AGE_DEPENDENT=1 if self._transmission_age_dependent else 0,
-                MIXED_PRECISION=1 if self._use_mixed_precision else 0,
-            )
-        elif self.csr_strategy == "warp":
-            grid = lambda meta: (
-                triton.cdiv(self.num_nodes, meta["NODES_PER_BLOCK"]),
-            )
-            _flash_renewal_fused_wc_kernel[grid](
-                row_ptr_ptr=self.graph.row_ptr,
-                col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                infectivity_ptr=self.infectivity,
-                age_ptr=self.age,
-                state_ptr=self.state,
-                beta=self._beta,
-                mu_ei=self._mu_ei,
-                sig_ei=self._sig_ei,
-                mu_ir=self._mu_ir,
-                sig_ir=self._sig_ir,
-                tau_ptr=self.tau,
-                rng_seed=self._rng_seed,
-                step_id_ptr=self._step_id,
-                next_state_ptr=self.next_state,
-                next_age_ptr=self.next_age,
-                next_infectivity_ptr=self.next_infectivity,
-                rates_ptr=self.rates,
-                N=self.num_nodes,
-                STATE_S=self._state_s,
-                STATE_E=self._state_e,
-                STATE_I=self._state_i,
-                STATE_R=self._state_r,
-                NODES_PER_BLOCK=self.nodes_per_block,
-                LANES_PER_NODE=self.lanes_per_node,
-                TRANSMISSION_AGE_DEPENDENT=1 if self._transmission_age_dependent else 0,
-            )
-        else:
-            BLOCK_SIZE = 128
-            grid = lambda meta: (triton.cdiv(self.num_nodes, meta["BLOCK_SIZE"]),)
-            _flash_renewal_fused_kernel[grid](
-                row_ptr_ptr=self.graph.row_ptr,
-                col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                infectivity_ptr=self.infectivity,
-                age_ptr=self.age,
-                state_ptr=self.state,
-                beta=self._beta,
-                mu_ei=self._mu_ei,
-                sig_ei=self._sig_ei,
-                mu_ir=self._mu_ir,
-                sig_ir=self._sig_ir,
-                tau_ptr=self.tau,
-                rng_seed=self._rng_seed,
-                step_id_ptr=self._step_id,
-                next_state_ptr=self.next_state,
-                next_age_ptr=self.next_age,
-                next_infectivity_ptr=self.next_infectivity,
-                rates_ptr=self.rates,
-                active_nodes_ptr=self._active_nodes_buffer,
-                num_active_ptr=self._num_active_device,
-                N=self.num_nodes,
-                STATE_S=self._state_s,
-                STATE_E=self._state_e,
-                STATE_I=self._state_i,
-                STATE_R=self._state_r,
-                BLOCK_SIZE=BLOCK_SIZE,
-                TRANSMISSION_AGE_DEPENDENT=1 if self._transmission_age_dependent else 0,
-                USE_COMPACTION=1 if self._use_active_compaction else 0,
-                MIXED_PRECISION=1 if self._use_mixed_precision else 0,
-            )
-
-        # In CG mode: copy back (can't pointer-swap baked addresses)
-        self.state.copy_(self.next_state)
-        self.age.copy_(self.next_age)
-        self.infectivity.copy_(self.next_infectivity)
-        self._compute_tau()
+    def _static_step_between(
+        self,
+        state,
+        age,
+        infectivity,
+        next_state,
+        next_age,
+        next_infectivity,
+    ) -> None:
+        """Captured step between explicit ping-pong buffers."""
+        self._launch_rates(
+            state,
+            age,
+            infectivity,
+            use_compaction=self._use_active_compaction,
+        )
+        self._compute_tau(elapsed_ptr=self.step_time_accumulator)
+        self._launch_transition(
+            state,
+            age,
+            next_state,
+            next_age,
+            next_infectivity,
+        )
 
     def _capture_graph(self) -> None:
-        """Capture CUDA Graph with snapshot/restore to avoid state mutation."""
-        # Snapshot all mutable tensor state
-        tensor_snapshot = {}
-        snapshot_names = [
-            'state', 'age', 'next_state', 'next_age',
-            'infectivity', 'next_infectivity',
-            'rates', 'tau', '_step_id', 'step_time_accumulator',
-        ]
-        if self._pressure_scratch is not None:
-            snapshot_names.append('_pressure_scratch')
-        for name in snapshot_names:
-            tensor_snapshot[name] = getattr(self, name).clone()
-        saved_time = self.current_time
-        saved_steps = self.total_steps
+        """Capture the construction-time graph and restore the clean state.
 
-        # Warmup runs (required for Triton JIT + CUDA Graph)
-        for _ in range(3):
-            self._static_step_forward()
-        torch.cuda.synchronize()
+        This private method is called only by ``__init__``, before callers can
+        supply an initial condition. Avoiding an O(N) snapshot here removes a
+        20--32*N byte construction-time peak; ``reset`` restores every mutable
+        simulation tensor after warmup/capture instead.
+        """
+        # Warm and capture on the engine's actual device rather than relying on
+        # the process-wide ambient CUDA device (important for cuda:1+).
+        with torch.cuda.device(self.device):
+            # Warm both directions of the ping-pong pair. Each pair returns the
+            # current state to the public A buffers, matching replay boundaries.
+            for _ in range(3):
+                self._static_step_between(
+                    self.state,
+                    self.age,
+                    self._infectivity,
+                    self.next_state,
+                    self.next_age,
+                    self._next_infectivity,
+                )
+                self._static_step_between(
+                    self.next_state,
+                    self.next_age,
+                    self._next_infectivity,
+                    self.state,
+                    self.age,
+                    self._infectivity,
+                )
+            torch.cuda.synchronize(self.device)
 
-        # Capture
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(self.steps_per_launch):
-                self._static_step_forward()
+            # Capture
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _ in range(self.steps_per_launch // 2):
+                    self._static_step_between(
+                        self.state,
+                        self.age,
+                        self._infectivity,
+                        self.next_state,
+                        self.next_age,
+                        self._next_infectivity,
+                    )
+                    self._static_step_between(
+                        self.next_state,
+                        self.next_age,
+                        self._next_infectivity,
+                        self.state,
+                        self.age,
+                        self._infectivity,
+                    )
 
-        self.graph_exec = g
+            self.graph_exec = g
 
-        # Restore — simulation starts exactly where the user left it
-        for name, snap in tensor_snapshot.items():
-            getattr(self, name).copy_(snap)
-        self.current_time = saved_time
-        self.total_steps = saved_steps
+            # Construction began from the engine's canonical empty state.
+            # Restore it without cloning dense arrays before capture.
+            self.reset()
+            self.step_time_accumulator.zero_()
 
     def step(self) -> Tuple[float, torch.Tensor]:
         """Execute steps_per_launch steps via CUDA Graph replay."""
+        self.graph._assert_unchanged(
+            self._graph_signature, owner=type(self).__name__
+        )
         # Active-node compaction refresh: happens OUTSIDE the captured
         # graph. This is the only place we touch _active_nodes_buffer /
         # _num_active_device; the captured graph reads them at fixed
         # pointers via the USE_COMPACTION constexpr path.
         self._refresh_active_set()
 
-        # Correctness contract for compaction: the fused kernel only
+        # Correctness contract for compaction: the rate kernel only
         # writes rate[i] for active i. Inactive (R) entries of the
         # rates buffer would otherwise retain STALE values from the
         # step at which that node last appeared in the active list
-        # (when it was still E or I with nonzero rate). The tau
-        # reduction `rates.max()` inside the captured graph would
-        # then pick up those stale rates, shrink tau, and diverge
-        # from the baseline trajectory. Zeroing rates once per replay
-        # window (one fast memset, ~10us at N=1e6) pins inactive
-        # positions to zero and matches the baseline's invariant
-        # that rate[R] = 0 every step.
+        # (when it was still E or I with nonzero rate). Compact max partials
+        # exclude inactive entries, but public ``rates`` remains authoritative;
+        # zeroing once per replay window pins every inactive position to its
+        # current absorbing-state rate. The transition phase still writes every
+        # node into the alternate buffer, so compacted ping-pong execution
+        # cannot retain stale infectious state or infectivity.
         if self._use_active_compaction:
             self.rates.zero_()
 
-        self.step_time_accumulator.zero_()
-        self.graph_exec.replay()
-
-        elapsed = float(self.step_time_accumulator.item())
+        with torch.cuda.device(self.device):
+            self.step_time_accumulator.zero_()
+            self.graph_exec.replay()
+            elapsed = float(self.step_time_accumulator.item())
+        if not math.isfinite(elapsed) or elapsed <= 0.0:
+            raise FloatingPointError(
+                "Fused renewal CUDA Graph elapsed time is non-finite or "
+                "non-positive; check model parameters, edge weights, ages, "
+                "and aggregate weighted degree"
+            )
         self.current_time += elapsed
         self.total_steps += self.steps_per_launch
 

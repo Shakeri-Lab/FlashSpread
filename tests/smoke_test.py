@@ -114,6 +114,40 @@ class TestFlashNeighbor:
         diff = (flash_result - ref_result).abs().max().item()
         assert diff < 1e-5, f"FlashNeighbor differs from reference by {diff}"
 
+    def test_weighted_influence_computation(self):
+        """The array-weight specialization preserves unsorted edge weights."""
+        from flashspread.core.graph import GraphCSR
+        from flashspread.core.flash_neighbor import FlashNeighbor, reference_influence
+
+        edge_index = torch.tensor(
+            [[2, 0, 1, 2, 0], [0, 2, 2, 0, 2]],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        weights = torch.tensor([3.0, 5.0, 7.0, 11.0, 13.0], device="cuda")
+        states = torch.tensor([1, 0, 1], device="cuda", dtype=torch.int32)
+        graph = GraphCSR(edge_index, 3, weights=weights)
+        actual = FlashNeighbor(graph, 1).compute_influence(states).clone()
+        expected = reference_influence(edge_index, 3, states, 1, weights=weights)
+        assert torch.equal(actual, expected)
+
+
+class TestMarkovianFrontier:
+    def test_weighted_parallel_edge_propagation(self):
+        from flashspread.core.flash_markovian import propagate_frontier
+        from flashspread.core.graph import GraphCSR
+
+        edge_index = torch.tensor(
+            [[0, 0, 1, 2], [2, 2, 2, 0]], device="cuda", dtype=torch.int64
+        )
+        weights = torch.tensor([2.0, 3.0, 5.0, 7.0], device="cuda")
+        outgoing = GraphCSR(edge_index, 3, weights=weights, incoming=False)
+        changed = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        delta = torch.tensor([1.0, -1.0], device="cuda")
+        influence = torch.zeros(3, device="cuda")
+        propagate_frontier(outgoing, changed, delta, influence)
+        assert torch.equal(influence, torch.tensor([0.0, 0.0, 0.0], device="cuda"))
+
 
 class TestSISModel:
     """Test SIS model rate computation."""
@@ -173,9 +207,11 @@ class TestMarkovianEngine:
         graph = FixedDegreeGraph(100, 10, device="cuda")
         model = SISModel(beta=0.5, delta=1.0)
         engine = MarkovianEngine(graph, model, device="cuda")
+        assert engine.device == engine.graph.row_ptr.device == engine.state.device
 
         engine.seed_infection(10)
-        initial_infected = engine.count_infected()
+        assert engine.outgoing_graph is engine.graph
+        assert engine._shares_outgoing_csr
 
         # Run a few steps
         for _ in range(10):
@@ -194,7 +230,6 @@ class TestMarkovianEngine:
         fraction. Without the fix, the engine silently discarded every
         new state and peak_I would stay stuck at the 10/100 seed level.
         """
-        import torch
         from flashspread import MarkovianEngine, SISModel, FixedDegreeGraph
 
         graph = FixedDegreeGraph(200, 10, device="cuda")
@@ -233,6 +268,104 @@ class TestMarkovianEngine:
         assert engine.current_time == 0.0
         assert engine.count_infected() == 0
 
+    @pytest.mark.parametrize("model_name", ["sis", "sir"])
+    def test_builtin_fast_path_keeps_weighted_influence_and_rates_current(
+        self, model_name
+    ):
+        from flashspread import GraphCSR, SIRModel, SISModel
+        from flashspread.core.reference import reference_influence_csr
+        from flashspread.engines.markovian import MarkovianEngine
+
+        edges = torch.tensor(
+            [[0, 0, 1, 2, 3, 4, 5], [1, 2, 2, 3, 4, 5, 0]],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        weights = torch.tensor(
+            [0.5, 1.5, 2.0, 0.75, 1.25, 0.25, 3.0], device="cuda"
+        )
+        graph = GraphCSR(edges, 6, weights=weights)
+        model = (
+            SISModel(beta=0.4, delta=0.3)
+            if model_name == "sis"
+            else SIRModel(beta=0.4, gamma=0.3)
+        )
+        engine = MarkovianEngine(graph, model, device="cuda", seed=13)
+        engine.set_initial_state(torch.tensor([1, 0, 1, 0, 0, 0]))
+
+        assert engine._builtin_gpu_kind == model_name
+        assert engine.influence.data_ptr() == engine.flash_neighbor.out_buffer.data_ptr()
+        for _ in range(12):
+            before = engine.state.clone()
+            tau, events = engine.step()
+            assert tau > 0.0
+            assert events == int((engine.state != before).sum())
+            expected_influence = reference_influence_csr(
+                graph, engine.state, model.infected
+            )
+            torch.testing.assert_close(
+                engine.influence, expected_influence, rtol=0.0, atol=2e-5
+            )
+            expected_rates = model.compute_rates(engine.state, expected_influence)
+            torch.testing.assert_close(engine.rates, expected_rates)
+
+    def test_markovian_cuda_graph_replay_restores_exact_boundary_influence(self):
+        from flashspread import GraphCSR, SIRModel
+        from flashspread.core.reference import reference_influence_csr
+        from flashspread.engines.markovian import MarkovianEngineCUDAGraph
+
+        nodes = torch.arange(32, device="cuda", dtype=torch.int64)
+        edges = torch.stack((nodes, (nodes + 1) % 32))
+        reverse = torch.stack((edges[1], edges[0]))
+        graph = GraphCSR(torch.cat((edges, reverse), dim=1), 32)
+        model = SIRModel(beta=0.8, gamma=0.2)
+        engine = MarkovianEngineCUDAGraph(
+            graph,
+            model,
+            device="cuda",
+            seed=17,
+            steps_per_launch=7,
+        )
+        engine.seed_infection(4)
+
+        elapsed, events = engine.step()
+        assert elapsed > 0.0
+        assert events >= 0
+        assert engine.total_steps == 7
+        assert engine.current_time == pytest.approx(elapsed)
+        expected = reference_influence_csr(graph, engine.state, model.infected)
+        torch.testing.assert_close(engine.influence, expected)
+        expected_rates = model.compute_rates(engine.state, expected)
+        torch.testing.assert_close(engine.rates, expected_rates)
+
+        engine.reset()
+        assert engine.total_steps == 0
+        assert engine.current_time == 0.0
+        assert int(engine._step_id_device.item()) == 0
+
+    def test_builtin_rng_preserves_high_seed_words(self):
+        from flashspread import FixedDegreeGraph, SISModel
+        from flashspread.engines.markovian import MarkovianEngine
+
+        graph = FixedDegreeGraph(512, 8, device="cuda", seed=4)
+        initial = (torch.arange(512, device="cuda") % 2).to(torch.int32)
+        # These two seeds collided under the former 32-bit key compression.
+        engines = [
+            MarkovianEngine(
+                graph,
+                SISModel(beta=0.5, delta=0.5),
+                device="cuda",
+                seed=seed,
+                max_prob=0.2,
+                theta=0.1,
+            )
+            for seed in (0, 0x0000000185EBCA77)
+        ]
+        for engine in engines:
+            engine.set_initial_state(initial)
+            engine.step()
+        assert not torch.equal(engines[0].state, engines[1].state)
+
 
 class TestRenewalEngine:
     """Test Renewal engine basic operation."""
@@ -244,6 +377,7 @@ class TestRenewalEngine:
         graph = FixedDegreeGraph(100, 10, device="cuda")
         model = SEIRModel(beta=0.3, mean_ei=5.0, median_ei=4.0, mean_ir=3.9, median_ir=1.5)
         engine = RenewalEngine(graph, model, device="cuda")
+        assert engine.device == engine.graph.row_ptr.device == engine.state.device
 
         engine.seed_infection(10, state=model.exposed)
 
@@ -533,6 +667,109 @@ class TestTritonErfcxAccuracy:
 class TestRenewalEngineFused:
     """Test fused Triton kernel engine (Phase 3)."""
 
+    @pytest.mark.parametrize(
+        "strategy,mixed",
+        [
+            ("thread", False),
+            ("warp", False),
+            ("merge", False),
+            ("thread", True),
+        ],
+    )
+    def test_first_tau_uses_current_weighted_rate(self, strategy, mixed):
+        """The first step must enforce epsilon, not sample with tau_max."""
+        from flashspread import GraphCSR, SEIRModel
+        from flashspread.engines.renewal_fused import RenewalEngineFused
+
+        # Four infectious sources feed target 0; their age-zero recovery
+        # hazards vanish, so the target's weighted pressure is the max rate.
+        edges = torch.tensor(
+            [[1, 2, 3, 4], [0, 0, 0, 0]], device="cuda", dtype=torch.int64
+        )
+        weights = torch.tensor([1.0, 2.0, 1.0, 2.0], device="cuda")
+        graph = GraphCSR(edges, 6, weights=weights)
+        model = SEIRModel(beta=0.5)
+        engine = RenewalEngineFused(
+            graph,
+            model,
+            device="cuda",
+            epsilon=0.03,
+            tau_max=1.0,
+            csr_strategy=strategy,
+            use_mixed_precision=mixed,
+        )
+        assert engine.device == engine.graph.row_ptr.device == engine.state.device
+        state = torch.tensor([0, 2, 2, 2, 2, 3], device="cuda")
+        engine.set_initial_state(state)
+        tau, _ = engine.step()
+        expected_rate = 0.5 * weights.sum().item()
+        assert tau == pytest.approx(0.03 / expected_rate, rel=2e-5)
+        assert engine.rates.max().item() * tau <= 0.03 * (1.0 + 2e-5)
+        expected_partial_width = engine.nodes_per_block if strategy == "warp" else 128
+        assert engine._max_rate_partials.numel() == (
+            engine.num_nodes + expected_partial_width - 1
+        ) // expected_partial_width
+        torch.testing.assert_close(engine._max_rate, engine.rates.max())
+        torch.testing.assert_close(
+            engine._max_rate_partials.max(), engine.rates.max()
+        )
+
+    def test_zero_rate_uses_tau_max(self):
+        from flashspread import GraphCSR, SEIRModel
+        from flashspread.engines.renewal_fused import RenewalEngineFused
+
+        graph = GraphCSR(
+            torch.empty((2, 0), device="cuda", dtype=torch.int64), 4
+        )
+        engine = RenewalEngineFused(
+            graph, SEIRModel(), device="cuda", epsilon=0.03, tau_max=0.7
+        )
+        tau, _ = engine.step()
+        assert tau == pytest.approx(0.7)
+
+    def test_constant_transmission_uses_scalar_infectivity_storage(self):
+        from flashspread import GraphCSR, SEIRModel
+        from flashspread.engines.renewal_fused import RenewalEngineFused
+
+        graph = GraphCSR(
+            torch.empty((2, 0), device="cuda", dtype=torch.int64), 4
+        )
+        engine = RenewalEngineFused(graph, SEIRModel(beta=0.3), device="cuda")
+        engine.set_initial_state(torch.tensor([0, 2, 3, 2], device="cuda"))
+
+        assert engine._infectivity.numel() == 1
+        assert engine._next_infectivity.numel() == 1
+        torch.testing.assert_close(
+            engine.infectivity,
+            torch.tensor([0.0, 0.3, 0.0, 0.3], device="cuda"),
+        )
+
+    def test_mixed_storage_keeps_small_tau_age_progress(self):
+        from flashspread import GraphCSR, SEIRModel
+        from flashspread.engines.renewal_fused import RenewalEngineFused
+
+        graph = GraphCSR(
+            torch.tensor([[1], [0]], device="cuda"),
+            3,
+            weights=torch.tensor([200.0], device="cuda"),
+        )
+        engine = RenewalEngineFused(
+            graph,
+            SEIRModel(beta=0.3),
+            device="cuda",
+            use_mixed_precision=True,
+        )
+        engine.set_initial_state(
+            torch.tensor([0, 2, 3], device="cuda"),
+            torch.tensor([0.0, 0.0, 2.0], device="cuda"),
+        )
+
+        tau, _ = engine.step()
+
+        assert tau < 2.0**-10  # below half an fp16 ULP at age=2
+        assert engine.age.dtype == torch.float32
+        assert engine.age[2].item() > 2.0
+
     def test_fused_step(self):
         """RenewalEngineFused runs steps and conserves population."""
         from flashspread.engines.renewal_fused import RenewalEngineFused
@@ -567,6 +804,76 @@ class TestRenewalEngineFused:
 
         counts = engine.count_by_state()
         assert counts.sum().item() == 200
+
+    def test_cudagraph_pingpong_matches_eager(self):
+        """Captured A->B->A replay needs no copy-back and preserves results."""
+        from flashspread.engines.renewal_fused import (
+            RenewalEngineFused,
+            RenewalEngineFusedCUDAGraph,
+        )
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(512, 8, device="cuda", seed=4)
+        eager = RenewalEngineFused(
+            graph, SEIRModel(), device="cuda", seed=9, csr_strategy="thread"
+        )
+        captured = RenewalEngineFusedCUDAGraph(
+            graph,
+            SEIRModel(),
+            device="cuda",
+            seed=9,
+            csr_strategy="thread",
+            steps_per_launch=10,
+        )
+        eager.seed_infection(40)
+        captured.seed_infection(40)
+        elapsed_eager = 0.0
+        for _ in range(10):
+            dt, _ = eager.step()
+            elapsed_eager += dt
+        elapsed_captured, _ = captured.step()
+        assert elapsed_captured == pytest.approx(elapsed_eager, rel=1e-6)
+        assert torch.equal(captured.state, eager.state)
+        assert torch.equal(captured.age, eager.age)
+        assert torch.equal(captured.infectivity, eager.infectivity)
+
+    def test_cudagraph_episode_seed_is_device_visible(self):
+        from flashspread.engines.renewal_fused import RenewalEngineFusedCUDAGraph
+        from flashspread import SEIRModel, FixedDegreeGraph
+
+        graph = FixedDegreeGraph(128, 8, device="cuda", seed=2)
+        engine = RenewalEngineFusedCUDAGraph(
+            graph, SEIRModel(), device="cuda", seed=11, steps_per_launch=2
+        )
+        engine.reset(episode=7)
+        assert int(engine._rng_seed.item()) == 18
+
+    def test_compacted_pingpong_clears_stale_alternate_infectivity(self):
+        from flashspread import GraphCSR, SEIRModel
+        from flashspread.engines.renewal_fused import RenewalEngineFusedCUDAGraph
+
+        # Reproduce the dangerous boundary condition directly: A says source 0
+        # is recovered, while B retains an old infectious value. The all-node
+        # transition phase must repair B before the captured B->A rate pass.
+        graph = GraphCSR(
+            torch.tensor([[0], [1]], device="cuda", dtype=torch.int64), 2
+        )
+        model = SEIRModel(beta=0.3, transmission_mode="age_dependent")
+        engine = RenewalEngineFusedCUDAGraph(
+            graph,
+            model,
+            device="cuda",
+            seed=3,
+            steps_per_launch=2,
+            csr_strategy="thread",
+            use_active_compaction=True,
+        )
+        engine.set_initial_state(torch.tensor([3, 0], device="cuda"))
+        engine.next_state[0] = model.infected
+        engine.next_infectivity[0] = model.beta
+        engine.step()
+        assert engine.rates[1].item() == 0.0
+        assert engine.state.tolist() == [model.recovered, model.susceptible]
 
 
 class TestFactoryFunction:

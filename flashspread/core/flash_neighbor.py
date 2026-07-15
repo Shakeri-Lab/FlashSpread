@@ -11,6 +11,23 @@ where N_in(i) are the incoming neighbors of node i.
 
 import torch
 
+from .graph import as_csr
+from .reference import (
+    reference_influence,
+    reference_influence_csr,
+    reference_influence_infectivity,
+    reference_influence_infectivity_csr,
+)
+
+__all__ = [
+    "FlashNeighbor",
+    "FlashNeighborInfectivity",
+    "reference_influence",
+    "reference_influence_csr",
+    "reference_influence_infectivity",
+    "reference_influence_infectivity_csr",
+]
+
 try:
     import triton
     import triton.language as tl
@@ -35,6 +52,7 @@ if _HAS_TRITON:
         out_ptr,
         inducer_state: tl.constexpr,
         N,
+        HAS_WEIGHTS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         """
@@ -59,7 +77,12 @@ if _HAS_TRITON:
             active_lane = (curr_ptr < row_end) & mask
             neighbor_id = tl.load(col_ind_ptr + curr_ptr, mask=active_lane, other=0)
             neighbor_state = tl.load(states_ptr + neighbor_id, mask=active_lane, other=-1)
-            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0).to(tl.float32)
+            if HAS_WEIGHTS:
+                weight = tl.load(
+                    weights_ptr + curr_ptr, mask=active_lane, other=0.0
+                ).to(tl.float32)
+            else:
+                weight = tl.full([BLOCK_SIZE], 1.0, tl.float32)
 
             is_inducer = neighbor_state == inducer_state
             pressure += tl.where(is_inducer & active_lane, weight, 0.0)
@@ -79,6 +102,8 @@ if _HAS_TRITON:
         out_ptr,
         N,
         L: tl.constexpr,
+        L_PAD: tl.constexpr,
+        HAS_WEIGHTS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         """
@@ -92,19 +117,25 @@ if _HAS_TRITON:
         node_indices = block_start + tl.arange(0, BLOCK_SIZE)
         mask_node = node_indices < N
 
-        # Load all inducer states
-        inducer_states = tl.load(inducer_ptr + tl.arange(0, L))
+        layer = tl.arange(0, L_PAD)
+        layer_mask = layer < L
+        inducer_states = tl.load(inducer_ptr + layer, mask=layer_mask, other=-1)
         row_start = tl.load(row_ptr_ptr + node_indices, mask=mask_node, other=0)
         row_end = tl.load(row_ptr_ptr + node_indices + 1, mask=mask_node, other=0)
 
-        acc = tl.zeros((BLOCK_SIZE, L), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_SIZE, L_PAD), dtype=tl.float32)
         curr_ptr = row_start
         active_any = tl.max(curr_ptr < row_end, axis=0)
 
         while active_any != 0:
             active_lane = (curr_ptr < row_end) & mask_node
             neighbor_id = tl.load(col_ind_ptr + curr_ptr, mask=active_lane, other=0)
-            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0).to(tl.float32)
+            if HAS_WEIGHTS:
+                weight = tl.load(
+                    weights_ptr + curr_ptr, mask=active_lane, other=0.0
+                ).to(tl.float32)
+            else:
+                weight = tl.full([BLOCK_SIZE], 1.0, tl.float32)
             neighbor_state = tl.load(states_ptr + neighbor_id, mask=active_lane, other=-1)
 
             # Check against all inducer states
@@ -116,10 +147,12 @@ if _HAS_TRITON:
             active_any = tl.max(curr_ptr < row_end, axis=0)
 
         # Store results
-        out_offsets = node_indices[:, None] * L + tl.arange(0, L)[None, :]
-        tl.store(out_ptr + out_offsets, acc, mask=mask_node[:, None])
-
-
+        out_offsets = node_indices[:, None] * L + layer[None, :]
+        tl.store(
+            out_ptr + out_offsets,
+            acc,
+            mask=mask_node[:, None] & layer_mask[None, :],
+        )
     @triton.jit
     def _flash_neighbor_infectivity_kernel(
         infectivity_ptr,
@@ -128,6 +161,7 @@ if _HAS_TRITON:
         weights_ptr,
         out_ptr,
         N,
+        HAS_WEIGHTS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         """
@@ -153,7 +187,12 @@ if _HAS_TRITON:
             active_lane = (curr_ptr < row_end) & mask
             neighbor_id = tl.load(col_ind_ptr + curr_ptr, mask=active_lane, other=0)
             neighbor_inf = tl.load(infectivity_ptr + neighbor_id, mask=active_lane, other=0.0)
-            weight = tl.load(weights_ptr + curr_ptr, mask=active_lane, other=0.0).to(tl.float32)
+            if HAS_WEIGHTS:
+                weight = tl.load(
+                    weights_ptr + curr_ptr, mask=active_lane, other=0.0
+                ).to(tl.float32)
+            else:
+                weight = tl.full([BLOCK_SIZE], 1.0, tl.float32)
 
             pressure += tl.where(active_lane, neighbor_inf * weight, 0.0)
 
@@ -169,54 +208,78 @@ else:
     _flash_neighbor_infectivity_kernel = None
 
 
-def reference_influence(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    states: torch.Tensor,
-    inducer_states: torch.Tensor | list | int,
-    weights: torch.Tensor | None = None,
+def _prepare_read_input(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    device: torch.device,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    """
-    Reference CPU/GPU implementation using scatter_add.
+    """Validate a read-only kernel input and normalize compatibility layouts."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} must have shape {list(shape)}")
+    if tensor.layout != torch.strided:
+        raise ValueError(f"{name} must use strided tensor storage")
+    # The Triton kernels receive a raw pointer but no stride metadata. Preserve
+    # the standard zero-copy path and copy only compatibility inputs whose dtype
+    # or layout cannot be represented by that pointer contract.
+    if tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    return tensor
 
-    This function computes the same result as FlashNeighbor but using
-    standard PyTorch operations. Useful for validation and fallback.
 
-    Args:
-        edge_index: [2, E] tensor of edges (source, target).
-        num_nodes: Number of nodes.
-        states: [N] tensor of current node states.
-        inducer_states: State(s) that induce influence (e.g., Infectious).
-        weights: Optional [E] tensor of edge weights.
+def _validate_output_buffer(
+    out: torch.Tensor,
+    *,
+    device: torch.device,
+    shape: tuple[int, ...],
+) -> None:
+    """Validate reusable writable storage before an asynchronous launch."""
+    if not isinstance(out, torch.Tensor):
+        raise TypeError("out_buffer must be a torch.Tensor")
+    if out.device != device:
+        raise ValueError(f"out_buffer must be on {device}, got {out.device}")
+    if tuple(out.shape) != shape:
+        raise ValueError(f"out_buffer must have shape {list(shape)}")
+    if out.dtype != torch.float32:
+        raise TypeError("out_buffer must have dtype torch.float32")
+    if out.layout != torch.strided or not out.is_contiguous():
+        raise ValueError("out_buffer must be a contiguous strided tensor")
 
-    Returns:
-        [N] or [N, L] tensor of influence values.
-    """
-    device = states.device
-    src = edge_index[0].to(device=device, dtype=torch.int64)
-    dst = edge_index[1].to(device=device, dtype=torch.int64)
 
-    if isinstance(inducer_states, int):
-        inducer_states = [inducer_states]
-    q_tensor = torch.as_tensor(inducer_states, device=device, dtype=states.dtype)
-    L = q_tensor.numel()
+def _byte_interval(tensor: torch.Tensor) -> tuple[int, int] | None:
+    """Return the occupied byte interval for a validated contiguous tensor."""
+    if tensor.numel() == 0:
+        return None
+    start = tensor.data_ptr()
+    return start, start + tensor.numel() * tensor.element_size()
 
-    if weights is None:
-        weights = torch.ones(src.numel(), device=device, dtype=torch.float32)
-    else:
-        weights = weights.to(device=device, dtype=torch.float32)
 
-    out = torch.zeros((num_nodes, L), device=device, dtype=torch.float32)
-
-    for li in range(L):
-        target_state = q_tensor[li]
-        # For incoming influence: source nodes contribute to target nodes
-        mask = (states[src] == target_state).float()
-        out[:, li].scatter_add_(0, dst, weights * mask)
-
-    if L == 1:
-        return out.squeeze(1)
-    return out
+def _reject_output_aliases(
+    out: torch.Tensor,
+    named_inputs: tuple[tuple[str, torch.Tensor], ...],
+) -> None:
+    """Reject overlapping read/write byte ranges before a Triton launch."""
+    out_interval = _byte_interval(out)
+    if out_interval is None:
+        return
+    out_start, out_end = out_interval
+    for name, tensor in named_inputs:
+        if tensor.device != out.device:
+            continue
+        interval = _byte_interval(tensor)
+        if interval is None:
+            continue
+        start, end = interval
+        if out_start < end and start < out_end:
+            raise ValueError(f"out_buffer must not overlap {name}")
 
 
 class FlashNeighbor:
@@ -245,9 +308,10 @@ class FlashNeighbor:
                 f"Triton is required for FlashNeighbor. Error: {_TRITON_IMPORT_ERROR}"
             )
 
-        self.graph = graph_csr
-        self.N = graph_csr.num_nodes
-        self.device = graph_csr.device
+        self.graph = as_csr(graph_csr)
+        self.N = self.graph.num_nodes
+        self.device = self.graph.device
+        self._graph_signature = self.graph._mutation_signature()
 
         if self.device.type != "cuda":
             raise RuntimeError("FlashNeighbor requires CUDA tensors")
@@ -258,8 +322,10 @@ class FlashNeighbor:
 
         self.inducer_states = torch.as_tensor(
             inducer_states, device=self.device, dtype=torch.int32
-        )
+        ).reshape(-1)
         self.L = int(self.inducer_states.numel())
+        if self.L == 0:
+            raise ValueError("inducer_states must contain at least one state")
 
         # Use optimized single-state kernel when possible
         if self.L == 1:
@@ -282,37 +348,76 @@ class FlashNeighbor:
             [N] tensor if single inducer state, [N, L] otherwise.
             Contains weighted count of neighbors in inducer states.
         """
-        if current_states.device.type != self.device.type:
-            raise ValueError("States must be on CUDA device")
-        if current_states.dtype != torch.int32:
-            current_states = current_states.to(torch.int32)
+        self.graph._assert_unchanged(
+            self._graph_signature, owner=type(self).__name__
+        )
+        current_states = _prepare_read_input(
+            current_states,
+            name="states",
+            device=self.device,
+            shape=(self.N,),
+            dtype=torch.int32,
+        )
+        output_shape = (self.N,) if self.L == 1 else (self.N, self.L)
+        _validate_output_buffer(
+            self.out_buffer,
+            device=self.device,
+            shape=output_shape,
+        )
+        inputs = [
+            ("states", current_states),
+            ("graph.row_ptr", self.graph.row_ptr),
+            ("graph.col_ind", self.graph.col_ind),
+            ("graph.weights_storage", self.graph.weights_storage),
+        ]
+        if self.L != 1:
+            inducer_states = _prepare_read_input(
+                self.inducer_states,
+                name="inducer_states",
+                device=self.device,
+                shape=(self.L,),
+                dtype=torch.int32,
+            )
+            inputs.append(("inducer_states", inducer_states))
+        else:
+            inducer_states = None
+        _reject_output_aliases(self.out_buffer, tuple(inputs))
+
+        if self.N == 0:
+            return self.out_buffer
 
         BLOCK_SIZE = 128
-        grid = lambda meta: (triton.cdiv(self.N, meta["BLOCK_SIZE"]),)
+        grid = (triton.cdiv(self.N, BLOCK_SIZE),)
 
-        if self.L == 1:
-            _flash_neighbor_single_kernel[grid](
-                states_ptr=current_states,
-                row_ptr_ptr=self.graph.row_ptr,
-                col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                out_ptr=self.out_buffer,
-                inducer_state=self.inducer_state,
-                N=self.N,
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
-        else:
-            _flash_neighbor_multi_kernel[grid](
-                states_ptr=current_states,
-                row_ptr_ptr=self.graph.row_ptr,
-                col_ind_ptr=self.graph.col_ind,
-                weights_ptr=self.graph.weights,
-                inducer_ptr=self.inducer_states,
-                out_ptr=self.out_buffer,
-                N=self.N,
-                L=self.L,
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
+        # Triton launches use the ambient CUDA device/stream. Pin the launch to
+        # the graph device so direct use remains correct on cuda:1+.
+        with torch.cuda.device(self.device):
+            if self.L == 1:
+                _flash_neighbor_single_kernel[grid](
+                    states_ptr=current_states,
+                    row_ptr_ptr=self.graph.row_ptr,
+                    col_ind_ptr=self.graph.col_ind,
+                    weights_ptr=self.graph.weights_storage,
+                    out_ptr=self.out_buffer,
+                    inducer_state=self.inducer_state,
+                    N=self.N,
+                    HAS_WEIGHTS=self.graph.has_weights,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                )
+            else:
+                _flash_neighbor_multi_kernel[grid](
+                    states_ptr=current_states,
+                    row_ptr_ptr=self.graph.row_ptr,
+                    col_ind_ptr=self.graph.col_ind,
+                    weights_ptr=self.graph.weights_storage,
+                    inducer_ptr=inducer_states,
+                    out_ptr=self.out_buffer,
+                    N=self.N,
+                    L=self.L,
+                    L_PAD=triton.next_power_of_2(self.L),
+                    HAS_WEIGHTS=self.graph.has_weights,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                )
 
         return self.out_buffer
 
@@ -344,9 +449,10 @@ class FlashNeighborInfectivity:
                 f"Triton is required for FlashNeighborInfectivity. Error: {_TRITON_IMPORT_ERROR}"
             )
 
-        self.graph = graph_csr
-        self.N = graph_csr.num_nodes
-        self.device = graph_csr.device
+        self.graph = as_csr(graph_csr)
+        self.N = self.graph.num_nodes
+        self.device = self.graph.device
+        self._graph_signature = self.graph._mutation_signature()
 
         if self.device.type != "cuda":
             raise RuntimeError("FlashNeighborInfectivity requires CUDA tensors")
@@ -364,59 +470,51 @@ class FlashNeighborInfectivity:
         Returns:
             [N] tensor of weighted infectivity from neighbors.
         """
-        if infectivity.dtype != torch.float32:
-            infectivity = infectivity.to(torch.float32)
+        self.graph._assert_unchanged(
+            self._graph_signature, owner=type(self).__name__
+        )
+        infectivity = _prepare_read_input(
+            infectivity,
+            name="infectivity",
+            device=self.device,
+            shape=(self.N,),
+            dtype=torch.float32,
+        )
+        _validate_output_buffer(
+            self.out_buffer,
+            device=self.device,
+            shape=(self.N,),
+        )
+        _reject_output_aliases(
+            self.out_buffer,
+            (
+                ("infectivity", infectivity),
+                ("graph.row_ptr", self.graph.row_ptr),
+                ("graph.col_ind", self.graph.col_ind),
+                ("graph.weights_storage", self.graph.weights_storage),
+            ),
+        )
+
+        if self.N == 0:
+            return self.out_buffer
 
         BLOCK_SIZE = 128
-        grid = lambda meta: (triton.cdiv(self.N, meta["BLOCK_SIZE"]),)
+        grid = (triton.cdiv(self.N, BLOCK_SIZE),)
 
-        _flash_neighbor_infectivity_kernel[grid](
-            infectivity_ptr=infectivity,
-            row_ptr_ptr=self.graph.row_ptr,
-            col_ind_ptr=self.graph.col_ind,
-            weights_ptr=self.graph.weights,
-            out_ptr=self.out_buffer,
-            N=self.N,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+        with torch.cuda.device(self.device):
+            _flash_neighbor_infectivity_kernel[grid](
+                infectivity_ptr=infectivity,
+                row_ptr_ptr=self.graph.row_ptr,
+                col_ind_ptr=self.graph.col_ind,
+                weights_ptr=self.graph.weights_storage,
+                out_ptr=self.out_buffer,
+                N=self.N,
+                HAS_WEIGHTS=self.graph.has_weights,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
 
         return self.out_buffer
 
     def __call__(self, infectivity: torch.Tensor) -> torch.Tensor:
         """Alias for compute_influence."""
         return self.compute_influence(infectivity)
-
-
-def reference_influence_infectivity(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    infectivity: torch.Tensor,
-    weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Reference implementation for infectivity-weighted influence.
-
-    Computes: influence[i] = sum_{j in N_in(i)} w_ji * infectivity[j]
-
-    Args:
-        edge_index: [2, E] tensor of edges (source, target).
-        num_nodes: Number of nodes.
-        infectivity: [N] tensor of per-node infectivity values.
-        weights: Optional [E] tensor of edge weights.
-
-    Returns:
-        [N] tensor of influence values.
-    """
-    device = infectivity.device
-    src = edge_index[0].to(device=device, dtype=torch.int64)
-    dst = edge_index[1].to(device=device, dtype=torch.int64)
-
-    if weights is None:
-        weights = torch.ones(src.numel(), device=device, dtype=torch.float32)
-    else:
-        weights = weights.to(device=device, dtype=torch.float32)
-
-    out = torch.zeros(num_nodes, device=device, dtype=torch.float32)
-    contributions = weights * infectivity[src]
-    out.scatter_add_(0, dst, contributions)
-    return out

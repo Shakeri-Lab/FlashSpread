@@ -34,10 +34,9 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 
-# Base install is CPU-importable: only torch + numpy are required to
-# `import flashspread`. The GPU kernels (triton) and the NetworkX/SciPy
-# graph utilities are optional extras so that `pip install flashspread`
-# succeeds on macOS/Windows/CPU-only CI and documentation runners.
+# A bare `import flashspread` is metadata-only. Torch and NumPy provide the
+# simulation runtime; optional extras add Triton GPU kernels, NetworkX topology
+# generators, and SciPy reverse Cuthill-McKee graph reordering independently.
 dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
@@ -45,10 +44,20 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["triton>=2.1"]
-graph = ["networkx>=3.0", "scipy>=1.10"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+graph = ["networkx>=3.0"]
+reorder = ["scipy>=1.10"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "networkx>=3.0",
+    "scipy>=1.10",
+]
 docs = ["mkdocs-material", "mkdocstrings[python]"]
-all = ["flashspread[gpu,graph,dev,docs]"]
+# All optional *runtime* capabilities. Development and documentation tooling
+# remain explicit extras and are not pulled into a user's simulation install.
+all = ["triton>=2.1", "networkx>=3.0", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/Shakeri-Lab/FlashSpread"

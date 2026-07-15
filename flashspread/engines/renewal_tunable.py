@@ -1,30 +1,36 @@
-"""
-Tunable Renewal Engine for roofline performance analysis.
+"""Quarantined synthetic engine retained for historical experiments.
 
-This module provides a variant of RenewalEngine with configurable
-parameters to explore the compute vs memory-bound tradeoff space.
+This compatibility module is not a production backend or a valid way to
+establish the production engine's arithmetic intensity:
+``compute_multiplier`` deliberately repeats rate evaluation.  Simulation
+semantics otherwise delegate to :class:`.RenewalEngine`, so graph mutation
+guards, invalid-rate handling, adaptive tau selection, RNG advancement, and
+renewal transitions cannot drift into a second implementation.
+
+Use ``experiments/benchmark_acceptance.py`` for current measurements.
 """
+
+from __future__ import annotations
+
+import operator
+from typing import Any
 
 import torch
-from typing import Tuple, Optional, Dict, Any
-import time
 
-from .renewal import RenewalEngine, RenewalEngineCUDAGraph
-from ..core.graph import GraphCSR
-from ..core.flash_neighbor import FlashNeighbor
+from .renewal import RenewalEngine
 
 
 class RenewalEngineTunable(RenewalEngine):
     """
-    Tunable version of RenewalEngine for roofline analysis.
+    Historical synthetic wrapper around :class:`RenewalEngine`.
 
     This engine exposes additional parameters to control the compute/memory
     intensity tradeoff, enabling systematic exploration of the roofline space.
 
     Key tunable parameters:
     - compute_multiplier: Artificially increase compute by repeating hazard evals
-    - dense_pressure: Force dense pressure computation for all nodes
-    - timing_enabled: Enable per-step timing for profiling
+    - dense_pressure: Add an artificial full pressure-buffer copy
+    - timing_enabled: Enable synchronized end-to-end step timing
 
     Example:
         >>> engine = RenewalEngineTunable(
@@ -61,29 +67,45 @@ class RenewalEngineTunable(RenewalEngine):
             seed: Random seed.
             compute_multiplier: Number of times to repeat hazard evaluation
                                (increases compute without changing results).
-            dense_pressure: If True, compute pressure for all nodes, not just
-                           susceptible (increases memory traffic).
-            timing_enabled: If True, record per-component timing.
+            dense_pressure: If True, copy the already-dense production
+                pressure into a second buffer (artificial memory traffic).
+            timing_enabled: If True, record synchronized pressure, hazard,
+                tau-selection, transition, and total GPU step times around the
+                production engine's private phase hooks.
         """
-        super().__init__(graph, model, device, epsilon, tau_max, seed)
+        if isinstance(compute_multiplier, bool):
+            raise TypeError("compute_multiplier must be an integer, not bool")
+        try:
+            compute_multiplier = operator.index(compute_multiplier)
+        except TypeError as exc:
+            raise TypeError("compute_multiplier must be an integer") from exc
+        if compute_multiplier <= 0:
+            raise ValueError("compute_multiplier must be positive")
+        if not isinstance(dense_pressure, bool):
+            raise TypeError("dense_pressure must be a bool")
+        if not isinstance(timing_enabled, bool):
+            raise TypeError("timing_enabled must be a bool")
 
-        self.compute_multiplier = int(compute_multiplier)
-        self.dense_pressure = bool(dense_pressure)
-        self.timing_enabled = bool(timing_enabled)
+        super().__init__(
+            graph,
+            model,
+            device=device,
+            epsilon=epsilon,
+            tau_max=tau_max,
+            seed=seed,
+        )
 
-        # Timing infrastructure
-        if self.timing_enabled and self.device.type == "cuda":
-            self._start_event = torch.cuda.Event(enable_timing=True)
-            self._end_event = torch.cuda.Event(enable_timing=True)
-            self._timing_records = {
-                "pressure": [],
-                "hazard": [],
-                "tau_select": [],
-                "transition": [],
-                "total": [],
-            }
-        else:
-            self._timing_records = None
+        self.compute_multiplier = compute_multiplier
+        self.dense_pressure = dense_pressure
+        self.timing_enabled = timing_enabled
+
+        # ``RenewalEngine._advance_from_pressure`` calls this hook.  Keep the
+        # production evaluator itself so the wrapper below can repeat only the
+        # explicitly synthetic work and delegate the entire transition tail.
+        self._production_rate_evaluator = self._rate_evaluator
+        self._rate_evaluator = self._evaluate_rates_synthetic
+
+        self._initialize_timing()
 
         # Additional buffer for dense pressure mode
         if self.dense_pressure:
@@ -91,134 +113,118 @@ class RenewalEngineTunable(RenewalEngine):
                 self.num_nodes, device=self.device, dtype=torch.float32
             )
 
-    def _step_impl_timed(self) -> torch.Tensor:
-        """
-        Step implementation with timing instrumentation.
-
-        Returns tau as a tensor for CUDA Graph compatibility.
-        """
-        if not self.timing_enabled or self.device.type != "cuda":
-            return self._step_impl_tunable()
-
-        total_start = torch.cuda.Event(enable_timing=True)
-        total_end = torch.cuda.Event(enable_timing=True)
-        phase_start = torch.cuda.Event(enable_timing=True)
-        phase_end = torch.cuda.Event(enable_timing=True)
-
-        total_start.record()
-
-        # Phase 1: Pressure computation
-        phase_start.record()
-        pressure = self.flash_neighbor.compute_influence(self.state)
-        if pressure.dim() > 1:
-            pressure = pressure.sum(dim=1)
-        self.pressure.copy_(pressure)
-
-        if self.dense_pressure:
-            # Force full pressure computation (increases memory traffic)
-            self.pressure_dense.copy_(pressure)
-        phase_end.record()
-        phase_end.synchronize()
-        self._timing_records["pressure"].append(phase_start.elapsed_time(phase_end))
-
-        # Phase 2: Hazard computation (with optional multiplier)
-        phase_start.record()
+    def _evaluate_rates_synthetic(
+        self,
+        age: torch.Tensor,
+        state: torch.Tensor,
+        pressure: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Repeat only rate evaluation; the final call supplies production rates."""
+        result = out
         for _ in range(self.compute_multiplier):
-            self.model.compute_rates(self.age, self.state, self.pressure, out=self.rates)
-        phase_end.record()
-        phase_end.synchronize()
-        self._timing_records["hazard"].append(phase_start.elapsed_time(phase_end))
+            result = self._production_rate_evaluator(
+                age, state, pressure, out=out
+            )
+        return result
 
-        # Phase 3: Adaptive tau selection
-        phase_start.record()
-        max_rate = self.rates.max()
-        tau_candidate = self.epsilon_t / (max_rate + 1e-12)
-        tau = torch.minimum(tau_candidate, self.tau_max_t)
-        tau = torch.where(max_rate < self.min_rate_t, self.tau_max_t, tau)
-        self.tau.copy_(tau)
-        phase_end.record()
-        phase_end.synchronize()
-        self._timing_records["tau_select"].append(phase_start.elapsed_time(phase_end))
+    def _initialize_timing(self) -> None:
+        """Allocate reusable CUDA events only for the historical timing mode."""
+        if not self.timing_enabled or self.device.type != "cuda":
+            self._timing_records = None
+            self._timing_events = None
+            return
+        self._timing_records = {
+            "pressure": [],
+            "hazard": [],
+            "tau_select": [],
+            "transition": [],
+            "total": [],
+        }
+        self._timing_events = {
+            phase: (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for phase in self._timing_records
+        }
+        # Retain the two historical private attributes for compatibility.
+        self._start_event, self._end_event = self._timing_events["total"]
 
-        # Phase 4: Transition sampling and application
-        phase_start.record()
-        self.event_prob.copy_(self.rates)
-        self.event_prob.mul_(self.tau)
-        self.event_prob.neg_().exp_()
-        self.event_prob.neg_().add_(1.0)
+    def _time_cuda_phase(self, phase: str, operation, *args):
+        """Run one production hook and append its synchronized GPU duration."""
+        if not self.timing_enabled or self.device.type != "cuda":
+            return operation(*args)
+        start_event, end_event = self._timing_events[phase]
+        with torch.cuda.device(self.device):
+            start_event.record()
+            result = operation(*args)
+            end_event.record()
+            end_event.synchronize()
+        self._timing_records[phase].append(
+            start_event.elapsed_time(end_event)
+        )
+        return result
 
-        self._rand_uniform(self.rand_buffer)
-        torch.lt(self.rand_buffer, self.event_prob, out=self.event_mask)
+    def _compute_pressure_with_synthetic_copy(self) -> None:
+        """Run production pressure and optionally add historical copy traffic."""
+        super()._compute_pressure_phase()
+        if self.dense_pressure:
+            self.pressure_dense.copy_(self.pressure)
 
-        self.age.add_(self.tau)
-        self.model.apply_transitions(self.state, self.event_mask, out=self.next_state)
+    def _compute_pressure_phase(self) -> None:
+        """Time the production pressure hook plus any synthetic copy."""
+        return self._time_cuda_phase(
+            "pressure", self._compute_pressure_with_synthetic_copy
+        )
 
-        changed = self.next_state != self.state
-        self.age.masked_fill_(changed, 0.0)
-        self.state.copy_(self.next_state)
-        phase_end.record()
-        phase_end.synchronize()
-        self._timing_records["transition"].append(phase_start.elapsed_time(phase_end))
+    def _evaluate_rates_phase(self) -> None:
+        """Time the rate hook, including all synthetic repetitions."""
+        return self._time_cuda_phase(
+            "hazard", super()._evaluate_rates_phase
+        )
 
-        total_end.record()
-        total_end.synchronize()
-        self._timing_records["total"].append(total_start.elapsed_time(total_end))
+    def _select_tau_phase(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Time the production adaptive-tau selection hook."""
+        return self._time_cuda_phase(
+            "tau_select", super()._select_tau_phase
+        )
 
-        return self.tau
+    def _transition_phase(
+        self,
+        valid_step: torch.Tensor,
+        safe_tau: torch.Tensor,
+    ) -> None:
+        """Time the production transactional transition hook."""
+        return self._time_cuda_phase(
+            "transition",
+            super()._transition_phase,
+            valid_step,
+            safe_tau,
+        )
 
     def _step_impl_tunable(self) -> torch.Tensor:
-        """
-        Step implementation with tunable compute intensity.
+        """Compatibility name for the production step with synthetic hooks."""
+        return super()._step_impl()
 
-        Returns tau as a tensor for CUDA Graph compatibility.
-        """
-        # Step 1: Compute pressure
-        pressure = self.flash_neighbor.compute_influence(self.state)
-        if pressure.dim() > 1:
-            pressure = pressure.sum(dim=1)
-        self.pressure.copy_(pressure)
-
-        if self.dense_pressure:
-            self.pressure_dense.copy_(pressure)
-
-        # Step 2: Compute hazard rates (with multiplier)
-        for _ in range(self.compute_multiplier):
-            self.model.compute_rates(self.age, self.state, self.pressure, out=self.rates)
-
-        # Step 3: Adaptive step selection
-        max_rate = self.rates.max()
-        tau_candidate = self.epsilon_t / (max_rate + 1e-12)
-        tau = torch.minimum(tau_candidate, self.tau_max_t)
-        tau = torch.where(max_rate < self.min_rate_t, self.tau_max_t, tau)
-        self.tau.copy_(tau)
-
-        # Step 4: Compute transition probabilities
-        self.event_prob.copy_(self.rates)
-        self.event_prob.mul_(self.tau)
-        self.event_prob.neg_().exp_()
-        self.event_prob.neg_().add_(1.0)
-
-        # Step 5: Sample transitions
-        self._rand_uniform(self.rand_buffer)
-        torch.lt(self.rand_buffer, self.event_prob, out=self.event_mask)
-
-        # Step 6: Apply transitions and renewal reset
-        self.age.add_(self.tau)
-        self.model.apply_transitions(self.state, self.event_mask, out=self.next_state)
-
-        changed = self.next_state != self.state
-        self.age.masked_fill_(changed, 0.0)
-        self.state.copy_(self.next_state)
-
-        return self.tau
+    def _step_impl_timed(self) -> torch.Tensor:
+        """Time the delegated production step and its stable phase hooks."""
+        return self._time_cuda_phase("total", self._step_impl_tunable)
 
     def _step_impl(self) -> torch.Tensor:
-        """Override base step implementation."""
+        """Select optional timing around the delegated production step."""
         if self.timing_enabled:
             return self._step_impl_timed()
         return self._step_impl_tunable()
 
-    def get_timing_stats(self) -> Dict[str, Dict[str, float]]:
+    def reset(self, episode: int | None = None) -> None:
+        """Reset production state and the optional synthetic copy buffer."""
+        super().reset(episode=episode)
+        if hasattr(self, "pressure_dense"):
+            self.pressure_dense.zero_()
+
+    def get_timing_stats(self) -> dict[str, dict[str, float]]:
         """
         Get timing statistics from recorded measurements.
 
@@ -246,7 +252,7 @@ class RenewalEngineTunable(RenewalEngine):
             for key in self._timing_records:
                 self._timing_records[key] = []
 
-    def get_config(self) -> Dict[str, Any]:
+    def get_config(self) -> dict[str, Any]:
         """Return configuration as dictionary."""
         return {
             "engine_type": "RenewalEngineTunable",
@@ -270,12 +276,7 @@ class RenewalEngineTunableCUDAGraph(RenewalEngineTunable):
     graph capture. Use the non-graph version for profiling.
     """
 
-    def __init__(
-        self,
-        *args,
-        steps_per_launch: int = 50,
-        **kwargs
-    ):
+    def __init__(self, *args, steps_per_launch: int = 50, **kwargs):
         """
         Initialize CUDA Graph tunable engine.
 
@@ -287,47 +288,18 @@ class RenewalEngineTunableCUDAGraph(RenewalEngineTunable):
         # Disable timing for graph mode
         kwargs["timing_enabled"] = False
         super().__init__(*args, **kwargs)
+        self._initialize_cuda_graph(steps_per_launch)
 
-        if self.device.type != "cuda":
-            raise RuntimeError("RenewalEngineTunableCUDAGraph requires CUDA device")
-
-        # Disable sparse hazard mode for CUDA Graph compatibility
-        if hasattr(self.model, "sparse_hazard"):
-            self.model.sparse_hazard = False
-
-        self.steps_per_launch = int(steps_per_launch)
-        self.step_time_accumulator = torch.zeros(1, device=self.device, dtype=torch.float32)
-
-        # Capture the graph
-        self.graph_exec = None
-        self._capture_graph()
-
-    def _static_step(self) -> None:
-        """Single step for CUDA Graph capture."""
-        tau = self._step_impl_tunable()
-        self.step_time_accumulator.add_(tau)
-
-    def _capture_graph(self) -> None:
-        """Capture CUDA Graph of multiple steps (with snapshot/restore)."""
-        self._capture_multistep_graph()
-
-    def step(self) -> Tuple[float, torch.Tensor]:
+    def step(self) -> tuple[float, torch.Tensor]:
         """
         Execute steps_per_launch steps via CUDA Graph replay.
 
         Returns:
             Tuple of (total_elapsed_time, current_state).
         """
-        self.step_time_accumulator.zero_()
-        self.graph_exec.replay()
+        return self._replay_cuda_graph()
 
-        elapsed = float(self.step_time_accumulator.item())
-        self.current_time += elapsed
-        self.total_steps += self.steps_per_launch
-
-        return elapsed, self.state
-
-    def get_config(self) -> Dict[str, Any]:
+    def get_config(self) -> dict[str, Any]:
         """Return configuration as dictionary."""
         config = super().get_config()
         config["engine_type"] = "RenewalEngineTunableCUDAGraph"
@@ -340,7 +312,7 @@ def estimate_flops_per_step(
     num_edges: int,
     compute_multiplier: int = 1,
     dense_hazard: bool = False,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """
     Estimate FLOPs per simulation step for roofline analysis.
 
@@ -393,7 +365,7 @@ def estimate_memory_bytes_per_step(
     num_nodes: int,
     num_edges: int,
     dense_pressure: bool = False,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """
     Estimate memory traffic per simulation step.
 

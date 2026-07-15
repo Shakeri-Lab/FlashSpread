@@ -1,6 +1,10 @@
 #!/usr/bin/env python
-"""
-Roofline Model Benchmark for FlashSpread Engines.
+"""Historical synthetic roofline exploration (not an acceptance benchmark).
+
+This script exercises ``RenewalEngineTunable`` and artificial compute
+multipliers. Its fixed A100-80GB ceiling and pre-two-phase byte formulas do not
+describe the current production engine. Use ``benchmark_acceptance.py`` plus
+Nsight Compute for publishable production-path measurements.
 
 This script runs systematic experiments to characterize the compute vs
 memory-bound behavior of the Renewal and Markovian engines under various
@@ -22,7 +26,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Any
+from typing import Any, List
 from pathlib import Path
 
 import torch
@@ -31,8 +35,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from flashspread import FixedDegreeGraph, SEIRModel, SISModel
-from flashspread.engines import RenewalEngine, MarkovianEngine
-from flashspread.engines.renewal import RenewalEngineCUDAGraph
+from flashspread.engines import MarkovianEngine
 from flashspread.engines.renewal_tunable import (
     RenewalEngineTunable,
     RenewalEngineTunableCUDAGraph,
@@ -475,7 +478,7 @@ def run_benchmarks(
 
                 results.append(result)
 
-                print(f"  Results:")
+                print("  Results:")
                 print(f"    Time/step: {result.time_per_step_ms:.3f} ms")
                 print(f"    Steps/sec: {result.steps_per_second:.1f}")
                 print(f"    Arithmetic Intensity: {result.arithmetic_intensity:.2f} FLOPs/byte")
@@ -593,6 +596,11 @@ def generate_summary(
 
 
 def main():
+    print(
+        "WARNING: benchmark_roofline.py is a historical synthetic experiment; "
+        "use experiments/benchmark_acceptance.py for production measurements.",
+        file=sys.stderr,
+    )
     parser = argparse.ArgumentParser(description="FlashSpread Roofline Benchmark")
     parser.add_argument(
         "--num-nodes", type=int, default=1_000_000,

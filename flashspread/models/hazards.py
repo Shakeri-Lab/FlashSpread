@@ -16,6 +16,8 @@ import torch
 import math
 from typing import Callable
 
+from ..utils import validate_fp32_control
+
 
 def lognormal_hazard(
     age: torch.Tensor,
@@ -23,7 +25,7 @@ def lognormal_hazard(
     median: float,
 ) -> torch.Tensor:
     """
-    Compute log-normal hazard rate (basic version).
+    Compute log-normal hazard from mean/median parameters.
 
     For a log-normal distribution with given mean and median:
         mu = ln(median)
@@ -33,8 +35,8 @@ def lognormal_hazard(
         f(t) = (1 / (t * sigma * sqrt(2*pi))) * exp(-(ln(t) - mu)^2 / (2*sigma^2))
         S(t) = 1 - Phi((ln(t) - mu) / sigma)
 
-    Warning: This basic version can suffer from numerical issues for large ages.
-    Use lognormal_hazard_stable for production code.
+    This compatibility signature delegates to the stable ``erfcx``
+    implementation; it no longer maintains a second tail-unstable formula.
 
     Args:
         age: Tensor of holding times (must be > 0).
@@ -44,28 +46,15 @@ def lognormal_hazard(
     Returns:
         Tensor of hazard rates.
     """
-    # Convert mean/median to mu/sigma
+    mean = validate_fp32_control("mean", mean, positive=True)
+    median = validate_fp32_control("median", median, positive=True)
+    if median <= 0.0 or mean <= median:
+        raise ValueError("Log-normal parameters require mean > median > 0")
+
+    # Convert mean/median and delegate to the one production implementation.
     mu = math.log(median)
     sigma = math.sqrt(2.0 * math.log(mean / median))
-
-    # Clamp age to avoid log(0)
-    t = torch.clamp(age, min=1e-10)
-
-    # Standardized variable
-    z = (torch.log(t) - mu) / sigma
-
-    # PDF: f(t) = phi(z) / (t * sigma)
-    phi_z = torch.exp(-0.5 * z * z) / math.sqrt(2 * math.pi)
-    pdf = phi_z / (t * sigma)
-
-    # Survival: S(t) = Phi^c(z) = 1 - Phi(z)
-    # Using erfc for better numerical stability
-    survival = 0.5 * torch.erfc(z / math.sqrt(2))
-
-    # Hazard: h(t) = f(t) / S(t)
-    hazard = pdf / (survival + 1e-10)
-
-    return hazard
+    return lognormal_hazard_stable(age, mu, sigma)
 
 
 def lognormal_hazard_stable(
@@ -84,7 +73,11 @@ def lognormal_hazard_stable(
         h(t) = sqrt(2/pi) / (t * sigma * erfcx(z))
     where z = (ln(t) - mu) / (sigma * sqrt(2))
 
-    This remains well-conditioned for all t > 0.
+    This remains well-conditioned for all t > 0. It is the unchecked tensor
+    primitive used inside hot engine paths: ``mu`` must be finite and
+    ``sigma`` must be finite and strictly positive. Public callers with
+    mean/median parameters should prefer :func:`lognormal_hazard`, which
+    validates and converts those parameters.
 
     Args:
         age: Tensor of holding times.
@@ -117,10 +110,10 @@ def erfcx_rational_approx(z: torch.Tensor) -> torch.Tensor:
     Rational approximation of erfcx(z) = exp(z^2) * erfc(z).
 
     Reference implementation in PyTorch for validating the Triton version.
-    Uses a Chebyshev-derived rational approximation that avoids the
-    numerical instability of computing exp(z^2) * erfc(z) separately.
-
-    Accuracy: max relative error < 1e-6 over [-10, 50].
+    Uses the direct identity for moderate inputs and a short asymptotic series
+    for large positive inputs. It is a lightweight standalone test oracle, not
+    the polynomial/range decomposition used by the current Triton kernel and
+    not a high-accuracy special-function replacement.
 
     Args:
         z: Input tensor.
@@ -130,14 +123,7 @@ def erfcx_rational_approx(z: torch.Tensor) -> torch.Tensor:
     """
     az = torch.abs(z)
 
-    # Region 1: |z| <= 4 — rational polynomial R_1(z)
-    # Coefficients from Cody (1969) / Abramowitz-Stegun derived fit
-    p = (
-        0.3275911 * az
-        + 0.2548296 * az ** 2
-        + 0.0000000 * az ** 3  # placeholder for structure
-    )
-    # Use the direct identity for moderate z:
+    # Region 1: use the direct identity for moderate z:
     # erfcx(z) = exp(z^2) * erfc(z)
     # For |z| <= 4, erfc is well-conditioned, so this is safe in fp32
     small = torch.exp(az * az) * torch.erfc(az)
@@ -185,6 +171,8 @@ def weibull_hazard(
     Returns:
         Tensor of hazard rates.
     """
+    shape = validate_fp32_control("shape", shape, positive=True)
+    scale = validate_fp32_control("scale", scale, positive=True)
     t = torch.clamp(age, min=1e-10)
     hazard = (shape / scale) * torch.pow(t / scale, shape - 1)
     return hazard
@@ -214,7 +202,10 @@ def gamma_hazard(
     Returns:
         Tensor of hazard rates.
     """
-    t = torch.clamp(age, min=1e-10)
+    shape = validate_fp32_control("shape", shape, positive=True)
+    rate = validate_fp32_control("rate", rate, positive=True)
+    result_dtype = age.dtype if age.is_floating_point() else torch.get_default_dtype()
+    t = torch.clamp(age.to(torch.float64), min=1e-10)
 
     # Use the identity: f(t)/S(t) where S uses regularized incomplete gamma
     # This is computationally expensive, so prefer Weibull or lognormal
@@ -224,16 +215,46 @@ def gamma_hazard(
         - rate * t
         - math.lgamma(shape)
     )
-    pdf = torch.exp(log_pdf)
-
     # Survival function using regularized upper incomplete gamma
     # S(t) = Q(shape, rate*t) = gammaincc(shape, rate*t)
     # PyTorch has igammac for this
-    survival = torch.igammac(torch.tensor(shape), rate * t)
-    survival = torch.clamp(survival, min=1e-10)
+    shape_t = torch.tensor(shape, device=age.device, dtype=torch.float64)
+    survival = torch.igammac(shape_t, rate * t)
 
-    hazard = pdf / survival
-    return hazard
+    # Evaluate the ratio in log space. For extreme tails where even fp64 Q
+    # underflows, evaluate the upper incomplete gamma with Lentz's continued
+    # fraction. In that representation h(t) simplifies to rate / (x * cf),
+    # avoiding both the density and survival underflows.
+    safe_survival = torch.where(survival > 0.0, survival, 1.0)
+    hazard = torch.exp(log_pdf - torch.log(safe_survival))
+    x = rate * t
+    x_cf = torch.maximum(x, torch.full_like(x, shape + 1.0))
+    tiny = 1e-300
+    b = x_cf + 1.0 - shape
+    c = torch.full_like(x_cf, 1.0 / tiny)
+    d = 1.0 / b
+    fraction = d
+    tiny_t = torch.full_like(x_cf, tiny)
+    for order in range(1, 33):
+        coefficient = -float(order) * (float(order) - shape)
+        b = b + 2.0
+        d = coefficient * d + b
+        d = torch.where(
+            d.abs() < tiny,
+            torch.copysign(tiny_t, d),
+            d,
+        )
+        c = b + coefficient / c
+        c = torch.where(
+            c.abs() < tiny,
+            torch.copysign(tiny_t, c),
+            c,
+        )
+        d = 1.0 / d
+        fraction = fraction * d * c
+    tail_hazard = rate / (x_cf * fraction)
+    hazard = torch.where(survival > 0.0, hazard, tail_hazard)
+    return hazard.to(result_dtype)
 
 
 def build_hazard_from_params(
@@ -247,7 +268,8 @@ def build_hazard_from_params(
     This is useful for building models programmatically from configuration.
 
     Args:
-        hazard_type: Type of hazard ("lognormal", "weibull", "network").
+        hazard_type: ``lognormal``, ``weibull``, ``gamma``, ``constant``, or
+            ``network``.
         device: Device for precomputed parameters.
         **params: Distribution parameters.
 
@@ -260,41 +282,50 @@ def build_hazard_from_params(
         ... )
         >>> rates = hazard_fn(age_tensor, pressure_tensor)
     """
+    if not isinstance(hazard_type, str):
+        raise TypeError("hazard_type must be a string")
     if hazard_type == "lognormal":
-        mean = float(params["mean"])
-        median = float(params["median"])
-
+        mean = validate_fp32_control("mean", params["mean"], positive=True)
+        median = validate_fp32_control(
+            "median", params["median"], positive=True
+        )
+        if median <= 0.0 or mean <= median:
+            raise ValueError("Log-normal parameters require mean > median > 0")
         if device is not None:
-            device = torch.device(device)
-            mu = torch.tensor(math.log(median), device=device, dtype=torch.float32)
-            sig = torch.tensor(
-                math.sqrt(2.0 * math.log(mean / median)),
-                device=device,
-                dtype=torch.float32,
-            )
+            torch.device(device)  # validate the optional compatibility hint
+        mu = math.log(median)
+        sig = math.sqrt(2.0 * math.log(mean / median))
+        validate_fp32_control("log(median)", mu)
+        validate_fp32_control("sigma", sig, positive=True)
 
-            def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
-                return lognormal_hazard_stable(age, mu, sig)
-
-        else:
-
-            def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
-                return lognormal_hazard(age, mean, median)
+        def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
+            return lognormal_hazard_stable(age, mu, sig)
 
         return _hazard
 
     elif hazard_type == "weibull":
-        shape = float(params["shape"])
-        scale = float(params["scale"])
+        shape = validate_fp32_control("shape", params["shape"], positive=True)
+        scale = validate_fp32_control("scale", params["scale"], positive=True)
 
         def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
             return weibull_hazard(age, shape, scale)
 
         return _hazard
 
+    elif hazard_type == "gamma":
+        shape = validate_fp32_control("shape", params["shape"], positive=True)
+        rate = validate_fp32_control("rate", params["rate"], positive=True)
+
+        def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
+            return gamma_hazard(age, shape, rate)
+
+        return _hazard
+
     elif hazard_type == "network":
         # Pure network-driven rate (Markovian)
-        beta = float(params["beta"])
+        beta = validate_fp32_control(
+            "beta", params["beta"], nonnegative=True
+        )
 
         def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
             return pressure * beta
@@ -303,7 +334,9 @@ def build_hazard_from_params(
 
     elif hazard_type == "constant":
         # Constant rate (exponential = Markovian)
-        rate = float(params["rate"])
+        rate = validate_fp32_control(
+            "rate", params["rate"], nonnegative=True
+        )
 
         def _hazard(age: torch.Tensor, pressure: torch.Tensor) -> torch.Tensor:
             return torch.full_like(age, rate)
