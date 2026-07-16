@@ -342,8 +342,11 @@ Use `--dry-run --output -` to validate a command and emit provenance without req
 GPU. Each harness also has a `profile` mode for one NVTX-delimited production call and a
 `print-ncu-command` mode for generating a profiler command.
 
-The performance models in [experiments/perf_model.py](experiments/perf_model.py) and
-[experiments/ensemble_perf_model.py](experiments/ensemble_perf_model.py) report logical
+The performance models in
+[experiments/perf_model.py](https://github.com/Shakeri-Lab/FlashSpread/blob/main/experiments/perf_model.py)
+and
+[experiments/ensemble_perf_model.py](https://github.com/Shakeri-Lab/FlashSpread/blob/main/experiments/ensemble_perf_model.py)
+report logical
 algorithmic traffic and storage. They do not substitute for measured HBM counters.
 
 ## Testing
@@ -377,7 +380,8 @@ run reports **347 passed, 45 skipped**; the final selected A100 validation repor
 
 ## License
 
-FlashSpread is released under the [MIT License](LICENSE).
+FlashSpread is released under the
+[MIT License](https://github.com/Shakeri-Lab/FlashSpread/blob/main/LICENSE).
 
 ## Acknowledgments
 
