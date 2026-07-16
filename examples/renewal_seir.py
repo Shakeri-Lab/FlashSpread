@@ -1,114 +1,93 @@
 #!/usr/bin/env python
-"""
-Example: Non-Markovian SEIR Epidemic Simulation
+"""Non-Markovian SEIR through the public Simulator and EngineConfig API.
 
-This example demonstrates the FlashSpread Renewal engine for simulating
-SEIR dynamics with log-normal dwell time distributions.
+Unlike a Markovian model, where the transition rate is constant and memoryless,
+the renewal SEIR model uses *age-dependent* hazards for E->I and I->R. That
+captures peaked incubation and recovery timing.
 
-Unlike Markovian models where transition rates are constant, the renewal
-SEIR model uses age-dependent hazards for the E->I and I->R transitions,
-capturing the realistic peaked timing of incubation and recovery.
+The same example uses the CPU reference path on CPU-only hosts and the fused
+CUDA-Graph path when a supported GPU and the ``gpu`` extra are available.
 """
 
 import time
-import torch
-from flashspread import RenewalEngine, SEIRModel, FixedDegreeGraph
+
+import flashspread as fs
 
 
 def main():
-    # Configuration
-    num_nodes = 10000
-    degree = 15
-    beta = 0.3  # Infection rate
+    num_nodes = 2_000
+    degree = 8
+    seed = 0
+    initial_exposed = 20
+    target_time = 20.0
+    device = fs.resolve_device()
 
-    # Log-normal parameters for incubation (E->I)
-    mean_ei = 5.0   # Mean incubation period
-    median_ei = 4.0  # Median incubation period
-
-    # Log-normal parameters for recovery (I->R)
-    mean_ir = 3.9   # Mean infectious period
-    median_ir = 1.5  # Median infectious period
-
-    initial_exposed = 100
-    target_time = 50.0
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print(f"FlashSpread Non-Markovian SEIR Example")
-    print(f"=" * 50)
-    print(f"Network: {num_nodes} nodes, degree {degree}")
-    print(f"Model: SEIR (beta={beta})")
-    print(f"  E->I: LogNormal(mean={mean_ei}, median={median_ei})")
-    print(f"  I->R: LogNormal(mean={mean_ir}, median={median_ir})")
-    print(f"Device: {device}")
-    print()
-
-    # Create network
-    print("Creating network...")
-    graph = FixedDegreeGraph(num_nodes, degree, device=device)
-    print(f"  Edges: {graph.num_edges}")
-
-    # Create model
-    model = SEIRModel(
-        beta=beta,
-        mean_ei=mean_ei,
-        median_ei=median_ei,
-        mean_ir=mean_ir,
-        median_ir=median_ir,
+    # Log-normal dwell times. SEIRModel requires mean > median > 0 (right-skewed).
+    model = fs.SEIRModel(
+        beta=0.3,
+        mean_ei=5.0, median_ei=4.0,    # incubation, E -> I
+        mean_ir=3.9, median_ir=1.5,    # infectious period, I -> R
     )
 
-    # Create engine
-    engine = RenewalEngine(graph, model, device=device, epsilon=0.03)
+    print("FlashSpread -- non-Markovian SEIR")
+    print("=" * 52)
+    graph = fs.regular_graph(
+        num_nodes,
+        degree=degree,
+        seed=seed,
+        device=device,
+        algorithm="circulant",
+    )
+    config = fs.EngineConfig(
+        backend="auto",
+        execution="auto",
+        traversal="auto",
+        transmission="model",
+        precision="fp32",
+        batch_steps=50,
+        epsilon=0.03,
+        tau_max=1.0,
+    )
+    sim = fs.Simulator(
+        graph,
+        model,
+        device=device,
+        seed=seed,
+        config=config,
+    ).seed_infection(initial_exposed)
 
-    # Seed initial exposed (not infected, to show incubation)
-    engine.seed_infection(initial_exposed, state=model.exposed)
-    print(f"  Initial exposed: {initial_exposed}")
+    print(f"  network : {num_nodes} nodes, degree {degree} ({graph.num_edges} directed edges)")
+    print(f"  engine  : {type(sim.engine).__name__} on {sim.device}")
+    print(f"  window  : {sim.steps_per_launch} step(s) per call")
     print()
 
-    # Run simulation
-    print("Running simulation...")
-    start_time = time.time()
+    t0 = time.time()
+    traj = sim.run(until=target_time, record_every=2.0)
+    elapsed = time.time() - t0
 
-    history = {"S": [], "E": [], "I": [], "R": [], "time": []}
-    print_interval = 5.0
-    next_print = 0.0
-
-    while engine.current_time < target_time:
-        engine.step()
-
-        if engine.current_time >= next_print:
-            counts = engine.count_by_state()
-            history["S"].append(counts[0].item())
-            history["E"].append(counts[1].item())
-            history["I"].append(counts[2].item())
-            history["R"].append(counts[3].item())
-            history["time"].append(engine.current_time)
-
-            print(f"  t={engine.current_time:5.1f}: "
-                  f"S={counts[0]:5d}, E={counts[1]:5d}, "
-                  f"I={counts[2]:5d}, R={counts[3]:5d}")
-
-            next_print += print_interval
-
-    elapsed = time.time() - start_time
+    print("      t      S      E      I      R")
+    for t, (s, e, i, r) in zip(traj.times, traj.counts):
+        print(f"  {t:5.1f} {s:6d} {e:6d} {i:6d} {r:6d}")
     print()
 
-    # Final results
-    print(f"Results")
-    print(f"=" * 50)
-    counts = engine.count_by_state()
-    print(f"Final state: S={counts[0]}, E={counts[1]}, I={counts[2]}, R={counts[3]}")
-    print(f"Total population: {counts.sum().item()} (should be {num_nodes})")
-    print(f"Attack rate: {(num_nodes - counts[0].item()) / num_nodes:.1%}")
-    print(f"Simulation steps: {engine.total_steps}")
-    print(f"Wall clock time: {elapsed:.2f}s")
-    print(f"Steps per second: {engine.total_steps / elapsed:.0f}")
+    print("Results")
+    print("=" * 52)
+    print(f"  peak infected : {traj.peak_infected} at t={traj.peak_time:.1f}")
+    print(f"  attack rate   : {traj.final_attack_rate:.1%}")
+    granularity = "window" if sim.steps_per_launch > 1 else "internal step"
+    print(
+        f"  end time      : {traj.times[-1]:.1f}  "
+        f"(first {granularity} at/past {target_time:.1f})"
+    )
+    print(f"  wall clock    : {elapsed:.2f}s")
 
-    # Find epidemic peak
-    if history["I"]:
-        peak_idx = history["I"].index(max(history["I"]))
-        print(f"\nEpidemic peak:")
-        print(f"  Time: {history['time'][peak_idx]:.1f}")
-        print(f"  Infected: {history['I'][peak_idx]}")
+    # Population must be conserved at every recorded sample.
+    assert (traj.counts.sum(axis=1) == num_nodes).all(), "population not conserved!"
+    print(f"  population conserved at all {len(traj)} samples: yes")
+
+    # traj.to_dict() is DataFrame-ready:
+    #   import pandas as pd; pd.DataFrame(traj.to_dict())
+    print(f"  columns       : {list(traj.to_dict())}")
 
 
 if __name__ == "__main__":

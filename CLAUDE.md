@@ -1,210 +1,220 @@
 # FlashSpread Development Notes
 
-## Recent Updates (2026-01-23)
+These notes are for contributors and coding agents. Keep user-facing installation,
+examples, performance results, and citation details in [README.md](README.md). The current
+manuscript source is `docs/jocs/FlashSpread-JOCS.tex` (local and gitignored). When prose,
+tests, and implementation disagree, inspect the live implementation and tests before
+changing a claim.
 
-### README Updated with Comprehensive Guidelines
+## Public API and design direction
 
-- Performance benchmarking section (roofline analysis, ablation results)
-- Scale guidelines: moderate (100K-1M), large (1M-10M), very large (10M+)
-- RL training configuration (fast, less accurate: `epsilon=0.1, tau_max=2.0`)
-- RL evaluation configuration (accurate: `epsilon=0.01, tau_max=0.5`)
-- Benchmarking instructions
-
-### Bug Fixes (2026-01-23)
-
-1. **Step count normalization** - CUDA Graph configs were running more total simulation steps than baseline. Now all configs run the same total simulation steps.
-
-2. **JSON serialization** - Fixed `numpy.bool_` not JSON serializable by converting to Python native types.
-
-3. **CUDA Graph dense mode (FIXED)** - `SEIRModel.compute_rates()` dense mode was using `torch.where()` which creates new tensors instead of modifying in-place. Fixed to use `out.copy_(torch.where(...))` for proper CUDA Graph compatibility.
-
----
-
-## Ablation Study Results (Job 7379061 - FIXED)
-
-| ID | Config | ms/step | Speedup | Infected | AccErr% | Pass |
-|----|--------|---------|---------|----------|---------|------|
-| 0 | baseline | 1.409 | 1.00x | 1369 | 0.0 | Y |
-| 1 | rcm_only | 1.391 | 1.01x | 1372 | 0.3 | Y |
-| 2 | fused_only | 1.417 | 0.99x | 1380 | 0.8 | Y |
-| 3 | block_256 | 1.381 | 1.02x | 1365 | 0.3 | Y |
-| 4 | **cuda_graph_only** | **0.249** | **5.65x** | **1300** | 5.0 | **Y** |
-| 5 | rcm_fused | 1.394 | 1.01x | 1351 | 1.3 | Y |
-| 6 | **rcm_cuda_graph** | **0.243** | **5.79x** | **1426** | 4.2 | **Y** |
-| 7 | **all_optimizations** | **0.242** | **5.82x** | **1383** | 1.0 | **Y** |
-| 8 | cuda_graph_100 | 0.254 | 5.54x | 1642 | 19.9 | N |
-| 9 | all_opt_100 | 0.245 | 5.76x | 1667 | 21.8 | N |
-
-### Key Findings
-
-1. **CUDA Graph (steps_per_launch=50)**: ~5.7x speedup, **all pass accuracy**
-2. **CUDA Graph (steps_per_launch=100)**: ~5.6x speedup, higher variance (~20% error)
-3. **Other optimizations**: Marginal (0.99x-1.02x)
-
-**Recommendation:** Use `RenewalEngineCUDAGraph` with `steps_per_launch=50` for best accuracy/speed tradeoff
-
----
-
-## Roofline Benchmark (Completed)
-
-**Job ID:** `7376334` - COMPLETED
-**Results:** `results/roofline_plot.png`, `results/roofline_summary.md`
-
-| Task | Config | Engine | Parameters |
-|------|--------|--------|------------|
-| 0 | renewal_baseline | renewal | epsilon=0.03, sparse=true |
-| 1 | renewal_dense | renewal | sparse=false |
-| 2-4 | renewal_batched_* | cuda_graph | steps_per_launch=10/50/100 |
-| 5 | renewal_small_tau | renewal | epsilon=0.01 |
-| 6 | renewal_large_tau | renewal | epsilon=0.1 |
-| 7 | renewal_compute_heavy | cuda_graph | sparse=false, mult=2 |
-| 8-9 | markov_* | markovian | baseline/aggressive |
-| **10** | **renewal_ridge_8** | cuda_graph | sparse=false, **mult=8** |
-| **11** | **renewal_ridge_16** | cuda_graph | sparse=false, **mult=16** |
-| **12** | **renewal_compute_bound** | cuda_graph | sparse=false, **mult=20** |
-
-**Key changes from v1:**
-- Fixed FLOP estimation (erfcx ~30 FLOPs, not counted before)
-- Added mult=8/16/20 configs to cross ridge point (AI > 9.6)
-
----
-
-## Roofline Analysis Results (Completed)
-
-**Key Finding:** Ridge crossing achieved at `compute_multiplier=16` (AI=16.08 > 9.6)
-
-**Efficiency:** 3-10% of theoretical roofline (typical for sparse irregular workloads)
-
-**Best Practical Config:** `renewal_batched_100` - 137.5 GFLOPS, 10.3% efficiency
-
-**Output:** `results/roofline_plot.png`, `results/roofline_summary.md`
-
----
-
-## Scalability Guidance
-
-### Renewal Engine (Non-Markovian SEIR) - Best Practices
+`Simulator` + `EngineConfig` is the preferred scalar interface. `Simulator` selects the
+model family, resolves the device, owns the seed, and records a `Trajectory`;
+`EngineConfig` validates dispatch choices before allocation or CUDA Graph capture.
 
 ```python
-from flashspread.engines.renewal import RenewalEngineCUDAGraph
+import flashspread as fs
 
-# RECOMMENDED: Use CUDA Graph for ~5.7x speedup
-engine = RenewalEngineCUDAGraph(
-    graph, model, device="cuda",
-    epsilon=0.03,         # Accuracy parameter (smaller = more steps, more accurate)
-    tau_max=1.0,          # Max time step
-    steps_per_launch=50,  # Optimal batch size (100 has higher variance)
+device = fs.resolve_device()
+graph = fs.regular_graph(
+    10_000,
+    degree=8,
+    seed=0,
+    device=device,
+    algorithm="circulant",
+)
+model = fs.SEIRModel(beta=0.3)
+config = fs.EngineConfig(epsilon=0.03, tau_max=1.0)
+trajectory = (
+    fs.Simulator(graph, model, device=device, seed=0, config=config)
+    .seed_infection(100)
+    .run(until=50.0)
 )
 ```
 
-**Parameter Tuning:**
-| Parameter | Effect | Recommendation |
-|-----------|--------|----------------|
-| `epsilon` | Controls step size accuracy | 0.03 (default) good balance |
-| `tau_max` | Maximum time step | 1.0 for stability |
-| `steps_per_launch` | CUDA Graph batch | 50 (100 has ~20% variance) |
+Rules for public API work:
 
-### Markovian Engine (SIS/SIR) - Best Practices
+- Prefer `EngineConfig` for new configuration. Legacy `**engine_kwargs` remain for
+  compatibility, but callers cannot combine them with `config=`.
+- Keep direct engine classes and factory functions available for power users, tests, and
+  benchmarks. Do not make them the recommended introductory API.
+- `Simulator` is intentionally scalar. Independent shared-graph trajectories use
+  `flashspread.engines.create_ensemble_engine`; their per-replica clocks do not fit the
+  scalar `Trajectory` contract.
+- Keep both examples facade-based and runnable on CPU or CUDA. They should demonstrate
+  `EngineConfig`, `Simulator`, `Trajectory`, and CSR-native graph construction.
 
-```python
-from flashspread.engines.markovian import MarkovianEngine
+## Execution contracts
 
-engine = MarkovianEngine(
-    graph, model, device="cuda",
-    max_prob=0.1,   # Max transition probability per step
-    theta=0.01,     # Target fraction of nodes transitioning
-    tau_max=1.0,    # Max time step
-)
+### GraphCSR
+
+`GraphCSR` is the canonical runtime graph:
+
+- CSR rows are incoming by default: a target row stores sources contributing pressure.
+- Offsets and node indices are int32, so nodes and stored directed entries must fit the
+  package's int32 limits.
+- Unit weights remain symbolic until the public `.weights` compatibility property is read.
+- The outgoing orientation needed by Markovian propagation is built lazily and cached.
+- Graph indices and weights are immutable while an engine is bound. Use
+  `graph.with_weights(...)` and construct a new engine for changed weights.
+- Engines accept a `GraphCSR` directly or a wrapper whose `.csr` is a `GraphCSR`.
+
+### Markovian SIS/SIR
+
+Markovian execution has CPU reference and CUDA implementations. Each internal leap
+evaluates rates and samples events over all `N` nodes, then propagates influence through
+the outgoing edges of changed nodes. The work is
+`O(N + sum(deg_out(v) for v in changed_frontier))`, not sparse `O(K)`.
+
+Automatic Markovian dispatch is eager on both CPU and CUDA. Exact built-in SIS/SIR can use
+explicit CUDA Graph batching, but that is opt-in through `EngineConfig(execution="cuda_graph")`.
+
+### Renewal SEIR
+
+Renewal execution must choose `tau` from the current state/age rate field. The production
+fused CUDA path is multi-phase:
+
+1. Traverse incoming CSR for susceptible pressure, evaluate stable log-normal hazards,
+   materialize public current rates, and emit compact maximum-rate partials.
+2. Reduce the partials and finalize the adaptive `tau` for that same rate field.
+3. Sample Bernoulli events, update state and age, and advance the clock.
+
+Do not describe this as one monolithic kernel. CUDA Graph execution replays the phase
+sequence for a fixed number of internal steps.
+
+Only the exact, unmodified built-in `SEIRModel` is eligible for the specialized fused
+scalar path. Subclasses, shadowed hooks, and custom renewal protocols use reference
+execution under automatic dispatch; forcing `backend="fused"` for them must fail rather
+than silently replace their semantics.
+
+### Ensembles
+
+Ensemble state, age, and rates are node-major `[N, R]`; `tau` and `current_time` are `[R]`.
+Every replica has an independent clock and random stream while sharing one CSR graph. CUDA
+auto-selects the tiled implementation; CPU uses the PyTorch reference. The exact built-in
+constant-transmission SEIR path additionally uses packed infectious-state bits, compact
+per-replica reductions, and a tiled transition phase.
+
+## Dispatch and numerical gotchas
+
+- `resolve_device(None)` chooses CUDA when available and CPU otherwise. CUDA execution
+  requires the `gpu` extra; force `device="cpu"` when validating a base install on a
+  CUDA-visible host without Triton.
+- Both Markovian and renewal scalar families have CPU reference paths.
+- The fused scalar CUDA Graph engine double-buffers and rounds odd `batch_steps` up to the
+  next even value. Read `sim.steps_per_launch` for the effective window.
+- `run(until=T)` stops at the first completed internal step or replay window at or beyond
+  `T`; `trajectory.times[-1]` is the actual end time. Recording is sampled at completed
+  steps/windows, not interpolated or backfilled.
+- `compact=True` requires fused CUDA Graph execution with thread traversal. If traversal is
+  `auto`, configuration resolution selects thread. Do not force thread compaction on
+  hub-heavy graphs without measuring it against auto/merge.
+- `precision="mixed"` requires the fused renewal backend and is valid with warp traversal.
+- Model parameters are copied into the engine at construction, and CUDA Graphs bind fixed
+  storage. Rebuild the engine after changing model parameters, graph topology, weights, or
+  intervention policy; there is no live control API.
+- `reset()` reproduces the base random stream. `reset(episode=k)` derives an independent
+  episode stream. Engines maintain private, full-width random streams; do not replace them
+  with process-global RNG calls in hot paths.
+- Bernoulli tau-leaping is approximate. Validate tolerance sensitivity and exact-reference
+  agreement for the intended model and observable; do not claim a universal fidelity floor.
+
+## Graph construction
+
+- `regular_graph(..., algorithm="circulant")` constructs exact-simple undirected regular
+  CSR directly with bounded temporary storage and no NetworkX dependency. It is structured,
+  not a uniformly sampled random-regular graph.
+- The default regular generator and the Barabasi-Albert, Watts-Strogatz, and geometric
+  generators use NetworkX and require the `graph` extra.
+- Existing CSR should enter through `fs.from_csr(...)`; COO `[source, target]` input should
+  enter through `fs.from_edges(...)`. Neither constructor adds reciprocal edges.
+- Use the circulant path for large deterministic performance workloads, and disclose its
+  graph semantics in every benchmark report.
+
+## Validation and performance evidence
+
+CPU/development checks:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest
+ruff check flashspread tests examples \
+  experiments/benchmark_acceptance.py \
+  experiments/benchmark_markovian.py \
+  experiments/benchmark_ensemble.py \
+  experiments/perf_model.py \
+  experiments/ensemble_perf_model.py
 ```
 
-**Parameter Tuning:**
-| Parameter | Effect | Recommendation |
-|-----------|--------|----------------|
-| `max_prob` | Step size control | 0.1 for accuracy, 0.2 for speed |
-| `theta` | Adaptive stepping | 0.01 (default) |
-| `tau_max` | Max step | 1.0-2.0 |
+For GPU tests, install `.[dev,gpu]` and run `python -m pytest -m gpu`. The latest complete
+local run is **347 passed, 45 skipped**; the selected final A100 validation is **73 passed**.
 
-### Graph Size Scaling
+Production acceptance harnesses:
 
-| Nodes | Edges (d=15) | GPU Memory | Recommended GPU |
-|-------|--------------|------------|-----------------|
-| 100K | 1.5M | ~200 MB | Any 4GB+ |
-| 1M | 15M | ~2 GB | 8GB+ |
-| 10M | 150M | ~20 GB | A100 40GB |
-| 100M | 1.5B | ~200 GB | Multi-GPU |
-
----
-
-## Analysis Code Location
-
+```bash
+python experiments/benchmark_acceptance.py walltime --case regular-constant
+python experiments/benchmark_acceptance.py walltime --case regular-age
+python experiments/benchmark_acceptance.py walltime --case regular-mixed
+python experiments/benchmark_acceptance.py walltime --case ba-auto
+python experiments/benchmark_markovian.py walltime
+python experiments/benchmark_ensemble.py walltime --replicas 32
 ```
-experiments/
-├── benchmark_roofline.py     # Roofline benchmark
-├── ablation_study.py         # Optimization ablation study
-└── roofline_utils.py         # Plotting utilities
 
+Evidence rules:
+
+- The current A100 snapshot and metric definitions live in the README. Do not duplicate a
+  second performance table here.
+- Acceptance checkpoints are deterministic synthetic states restored independently, not
+  epidemic phases observed along one trajectory.
+- Scalar NUPS is `N * internal steps / target wall time`; ensemble throughput is
+  `N * replicas / step wall time`. Neither metric is realized transitions or unique nodes.
+- The regular acceptance workload is a seeded circulant; say so explicitly.
+- Construction, checkpoint restoration, and warmup are outside the timed target.
+- `experiments/benchmark_roofline.py` is historical synthetic exploration, not production
+  characterization. Nsight Compute failed with `ERR_NVGPUCTRPERM`; do not assert a
+  compute-bound or memory-bound roofline classification without hardware counters.
+- `results/speed_check/` contains historical measurements from an older pipeline. Use the
+  production acceptance harnesses and final local `logs/a100_final_*.json` artifacts for
+  current evidence. `logs/` is ignored; never force-add the whole directory.
+
+## Repository layout
+
+```text
 flashspread/
+├── __init__.py                 # lazy public exports
+├── config.py                   # immutable EngineConfig and dispatch policy
+├── simulator.py                # scalar public facade
+├── trajectory.py               # recorded scalar observables
+├── graphs.py                   # public graph constructors
 ├── engines/
-│   ├── __init__.py           # Factory functions: create_renewal_engine(), create_markovian_engine()
-│   ├── renewal.py            # RenewalEngine, RenewalEngineCUDAGraph
-│   ├── markovian.py          # MarkovianEngine
-│   └── renewal_tunable.py    # FLOP/byte estimation
+│   ├── __init__.py             # scalar and ensemble factories
+│   ├── markovian.py            # CPU/CUDA SIS/SIR execution
+│   ├── renewal.py              # renewal reference variants
+│   ├── renewal_fused.py        # fused scalar CUDA execution
+│   └── ensemble.py             # reference/tiled shared-graph ensembles
+├── models/                     # SIS, SIR, SEIR, and hazard functions
 └── core/
-    ├── flash_neighbor.py     # FlashNeighbor Triton kernel
-    └── optimizations.py      # RCM reordering, OptimizationConfig
+    ├── graph.py                # canonical GraphCSR
+    ├── flash_neighbor.py       # CSR influence kernels
+    ├── flash_markovian.py      # Markovian Triton kernels
+    ├── flash_renewal_kernel.py # fused renewal kernels/finalizer
+    ├── flash_ensemble*.py      # tiled ensemble kernels
+    └── host_rng.py             # seed normalization and host streams
 
-docs/
-└── PERFORMANCE_ANALYSIS.md   # Comprehensive performance documentation
+examples/                       # Simulator/EngineConfig examples
+experiments/                    # acceptance, profiling, and performance models
+tests/                          # CPU and GPU correctness/dispatch coverage
+slurm/                          # cluster wrappers
+docs/jocs/                      # local manuscript source (gitignored)
 ```
 
-## Factory Functions
+## Cluster and manuscript workflow
 
-```python
-from flashspread.engines import create_renewal_engine, create_markovian_engine
-
-# RECOMMENDED: CUDA Graph with steps_per_launch=50 for ~5.7x speedup
-engine = create_renewal_engine(graph, model, use_cuda_graph=True, steps_per_launch=50)
-
-# For Markovian models
-engine = create_markovian_engine(graph, model)
-```
-
----
-
-## Project Structure
-
-```
-flashspread/
-├── engines/
-│   ├── markovian.py          # Sparse O(K) Markovian engine
-│   ├── renewal.py            # Dense O(N) non-Markovian engine
-│   └── renewal_tunable.py    # Tunable version for roofline analysis
-├── models/
-│   ├── compartmental.py      # SIS, SIR, SEIR models
-│   └── hazards.py            # lognormal_hazard_stable (erfcx)
-└── core/
-    ├── flash_neighbor.py     # Triton kernel for influence computation
-    ├── graph.py              # CSR graph structure
-    └── network.py            # Graph generators
-
-experiments/
-├── benchmark_roofline.py     # Main benchmark script
-└── roofline_utils.py         # Plotting utilities
-
-slurm/
-├── run_roofline_array.sbatch # Array job (13 parallel configs)
-└── merge_roofline_results.sbatch
-```
-
----
-
-## Archive
-
-### Completed: Initial Release (2026-01-16)
-- FlashSpread v1.0.0 with dual-engine architecture
-- FlashNeighbor Triton kernel
-- Markovian (SIS/SIR) and Renewal (SEIR) engines
-- CUDA Graph support for RenewalEngine
-
-### Completed: Device Comparison Fix (2026-01-23)
-- Fixed device comparison in FlashNeighbor (`00bfb29`)
+- GPU work uses SLURM allocation `-A cdt_computing`, partition `-p gpu`, and typically
+  `--gres=gpu:a100:1`. Add the 80 GB constraint only when the workload needs it.
+- `/tmp` is node-local. Put SLURM stdout/stderr and artifacts on shared storage when they
+  must remain visible after the job.
+- Manuscript source: `docs/jocs/FlashSpread-JOCS.tex`. Load the site TeX Live module and
+  use `latexmk -pdf`; do not commit generated TeX artifacts unless explicitly requested.
+- Preserve unrelated dirty worktree files. Stage explicit paths rather than `git add -A`.
+- Author commits as the repository owner; do not add an AI/Claude co-author trailer.

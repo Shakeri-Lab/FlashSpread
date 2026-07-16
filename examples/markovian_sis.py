@@ -1,87 +1,87 @@
 #!/usr/bin/env python
-"""
-Example: Markovian SIS Epidemic Simulation
+"""Markovian SIS through the public Simulator and EngineConfig API.
 
-This example demonstrates the FlashSpread Markovian engine for simulating
-SIS (Susceptible-Infected-Susceptible) dynamics on a random network.
-
-The SIS model allows reinfection after recovery, leading to endemic
-equilibrium where a fraction of the population remains infected.
+SIS permits reinfection after recovery and can approach an endemic equilibrium.
+The same example uses the CPU reference path on CPU-only hosts and the CUDA path
+when a supported GPU and the ``gpu`` extra are available.
 """
 
+import sys
 import time
-import torch
-from flashspread import MarkovianEngine, SISModel, FixedDegreeGraph
+
+import flashspread as fs
 
 
 def main():
-    # Configuration
-    num_nodes = 10000
-    degree = 15
-    beta = 0.5  # Infection rate
-    delta = 1.0  # Recovery rate
-    initial_infected = 100
-    num_steps = 1000
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    num_nodes = 2_000
+    degree = 8
+    beta, delta = 0.5, 1.0
+    seed = 0
+    initial_infected = 20
+    target_time = 10.0
+    device = fs.resolve_device()
 
-    print(f"FlashSpread Markovian SIS Example")
-    print(f"=" * 50)
-    print(f"Network: {num_nodes} nodes, degree {degree}")
-    print(f"Model: SIS (beta={beta}, delta={delta})")
-    print(f"Device: {device}")
+    print("FlashSpread -- Markovian SIS")
+    print("=" * 52)
+
+    # The direct circulant path avoids a NetworkX dependency and builds exact
+    # degree-regular incoming CSR on the selected device.
+    graph = fs.regular_graph(
+        num_nodes,
+        degree=degree,
+        seed=seed,
+        device=device,
+        algorithm="circulant",
+    )
+    model = fs.SISModel(beta=beta, delta=delta)
+    config = fs.EngineConfig(
+        execution="auto",  # eager by default for Markovian models
+        max_prob=0.1,
+        theta=0.01,
+        tau_min=1e-6,
+        tau_max=1.0,
+    )
+    sim = fs.Simulator(
+        graph,
+        model,
+        device=device,
+        seed=seed,
+        config=config,
+    ).seed_infection(initial_infected)
+
+    print(f"  network : {num_nodes} nodes, degree {degree}")
+    print(f"  model   : SIS (beta={beta}, delta={delta})")
+    print(f"  engine  : {type(sim.engine).__name__} on {sim.device}")
     print()
 
-    # Create network
-    print("Creating network...")
-    graph = FixedDegreeGraph(num_nodes, degree, device=device)
-    print(f"  Edges: {graph.num_edges}")
+    t0 = time.time()
+    traj = sim.run(until=target_time, record_every=2.0)
+    elapsed = time.time() - t0
 
-    # Create model
-    model = SISModel(beta=beta, delta=delta)
-
-    # Create engine
-    engine = MarkovianEngine(graph, model, device=device)
-
-    # Seed initial infection
-    engine.seed_infection(initial_infected)
-    print(f"  Initial infected: {engine.count_infected()}")
+    print("      t      S      I")
+    for t, (s, i) in zip(traj.times, traj.counts):
+        print(f"  {t:5.1f} {s:6d} {i:6d}")
     print()
 
-    # Run simulation
-    print("Running simulation...")
-    start_time = time.time()
+    print("Results")
+    print("=" * 52)
+    print(f"  peak infected : {traj.peak_infected}")
+    print(f"  wall clock    : {elapsed:.2f}s")
+    assert (traj.counts.sum(axis=1) == num_nodes).all(), "population not conserved!"
+    print("  population conserved: yes")
 
-    infected_history = []
-    for step in range(num_steps):
-        tau, num_events = engine.step()
-        infected = engine.count_infected()
-        infected_history.append(infected)
-
-        if step % 200 == 0:
-            print(f"  Step {step}: time={engine.current_time:.2f}, infected={infected}")
-
-    elapsed = time.time() - start_time
-    print()
-
-    # Results
-    print(f"Results")
-    print(f"=" * 50)
-    print(f"Simulation time: {engine.current_time:.2f}")
-    print(f"Total events: {engine.total_events}")
-    print(f"Final infected: {engine.count_infected()}")
-    print(f"Wall clock time: {elapsed:.2f}s")
-    print(f"Throughput: {engine.total_events / elapsed:.2e} events/sec")
-
-    # Check for endemic equilibrium
-    # Expected endemic prevalence: 1 - delta/(beta * degree) if R0 > 1
+    # Endemic equilibrium: mean-field predicts prevalence 1 - 1/R0 for R0 > 1.
+    # This is only a homogeneous-mixing reference; a finite network can differ.
     r0 = beta * degree / delta
+    final_prevalence = traj.final_prevalence
+    print()
+    print(f"  R0 (mean-field)      : {r0:.2f}")
     if r0 > 1:
-        expected_prevalence = 1 - 1/r0
-        actual_prevalence = engine.count_infected() / num_nodes
-        print(f"\nR0 = {r0:.2f} (epidemic)")
-        print(f"Expected endemic prevalence: {expected_prevalence:.3f}")
-        print(f"Actual prevalence: {actual_prevalence:.3f}")
+        print(f"  predicted prevalence : {1 - 1 / r0:.3f}  (homogeneous mixing)")
+    print(f"  measured prevalence  : {final_prevalence:.3f}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
