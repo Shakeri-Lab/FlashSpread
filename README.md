@@ -29,15 +29,20 @@ with independent trajectories.
 
 ## Installation
 
+Install FlashSpread from PyPI:
+
+```bash
+python -m pip install flashspread
+
+# Add Triton GPU kernels and NetworkX-backed graph generators
+python -m pip install "flashspread[gpu,graph]"
+```
+
+For editable development from source:
+
 ```bash
 git clone https://github.com/Shakeri-Lab/FlashSpread.git
 cd FlashSpread
-
-# Runtime with CPU reference execution
-python -m pip install -e .
-
-# Add Triton GPU kernels and NetworkX-backed graph generators
-python -m pip install -e ".[gpu,graph]"
 
 # CPU development environment
 python -m pip install -e ".[dev]"
