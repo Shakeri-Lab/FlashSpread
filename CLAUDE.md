@@ -239,9 +239,14 @@ Evidence rules:
 - `experiments/benchmark_roofline.py` is historical synthetic exploration, not production
   characterization. Nsight Compute failed with `ERR_NVGPUCTRPERM`; do not assert a
   compute-bound or memory-bound roofline classification without hardware counters.
-- `results/speed_check/` contains historical measurements from an older pipeline. Use the
-  production acceptance harnesses and final local `logs/a100_final_*.json` artifacts for
-  current evidence. `logs/` is ignored; never force-add the whole directory.
+- `results/acceptance/<case>-<commit>.json` is the current evidence set, produced by
+  `slurm/run_acceptance_matrix.sbatch` (all ten documented measurements, one array task
+  each, pinned to `-C a100_80gb`). Each file records the commit, a source digest, the
+  environment and clock/throttle samples either side of the timed work, and the harness
+  refuses to run against a worktree that does not match HEAD.
+- `results/speed_check/` and `logs/a100_final_*.json` are historical measurements from
+  older pipelines. Prefer `results/acceptance/`. `logs/` is ignored; never force-add the
+  whole directory.
 
 ## Repository layout
 

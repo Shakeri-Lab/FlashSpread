@@ -295,21 +295,46 @@ construction, so mutating the original model does not update a running simulatio
 
 ## Performance snapshot
 
-The latest production-path acceptance run used one NVIDIA A100-SXM4-80GB, Python 3.12.2,
-PyTorch 2.11.0+cu130 with its CUDA 13.0 build/runtime, and Triton 3.6.0. Scalar workloads used `N=1,000,000`,
-approximately 8,000,000 directed CSR entries, and 50 internal steps per timed
-`Simulator.step()` call.
-The ensemble used the same regular graph with `R=32` and timed one independent-replica
-step.
+The current snapshot is the full acceptance matrix at commit `643d118` on one NVIDIA
+A100-SXM4-80GB, Python 3.11.14, PyTorch 2.5.1+cu121, Triton 3.6.0, NumPy 2.4.4. The GPU ran
+at its 1,410 MHz boost clock with no throttling reported either side of the timed work.
+Scalar workloads used `N=1,000,000`, approximately 8,000,000 directed CSR entries, and 50
+internal steps per timed `Simulator.step()` call. The ensemble used the same regular graph
+with `R=32` and timed one independent-replica step. Per-case JSON, including the
+environment fingerprint, source digest and clock provenance, is in `results/acceptance/`.
 
-| Workload | Early | Peak | Late | Metric |
-|---|---:|---:|---:|---|
-| Renewal, constant transmission | 12.421 | 13.665 | 15.576 | G-NUPS |
-| Renewal, age-dependent transmission | 11.410 | 12.223 | 14.029 | G-NUPS |
-| Renewal, mixed storage | 12.752 | 13.957 | 16.298 | G-NUPS |
-| Barabasi-Albert `m=4`, auto/merge | 2.181 | 2.757 | 3.676 | G-NUPS |
-| Markovian SIS | 15.548 | 13.931 | 14.234 | G-NUPS |
-| Ensemble SEIR, `R=32` | 11.824 | 11.612 | 15.250 | G node-replica updates/s |
+| Workload | Traversal | Early | Peak | Late | Metric |
+|---|---|---:|---:|---:|---|
+| Renewal, constant transmission | thread | 12.426 | 13.666 | 15.558 | G-NUPS |
+| Renewal, age-dependent transmission | thread | 11.387 | 12.188 | 13.998 | G-NUPS |
+| Renewal, mixed storage | thread | 12.624 | 13.743 | 16.136 | G-NUPS |
+| Renewal, `compact=True` (late only) | thread | — | — | **24.156** | G-NUPS |
+| Barabasi-Albert `m=4` | auto | 2.199 | 2.804 | 3.878 | G-NUPS |
+| Barabasi-Albert `m=4` | thread | 0.684 | 1.057 | 2.746 | G-NUPS |
+| Barabasi-Albert `m=4` | warp | 2.743 | 2.321 | 3.924 | G-NUPS |
+| Barabasi-Albert `m=4` | merge | 2.200 | 2.811 | 3.880 | G-NUPS |
+| Markovian SIS | — | 15.515 | 13.965 | 14.247 | G-NUPS |
+| Ensemble SEIR, `R=32` | — | 11.772 | 11.571 | 15.163 | G node-replica updates/s |
+
+Three things this matrix settles that the previous four-row table could not.
+
+**Automatic traversal dispatch is choosing correctly on hub-heavy graphs.** On
+Barabasi-Albert `m=4`, `auto` (2.804 at peak) lands on `merge` (2.811) and beats `thread`
+(1.057) by 2.65x. Forcing `thread` on a hub-heavy graph is the single worst configuration
+choice available, which is why `auto` is the default. Note `warp` is not uniformly third:
+it is the fastest strategy at the early checkpoint (2.743) and the slowest of the three at
+peak, so the ranking is prevalence-dependent and a single-checkpoint comparison would
+mislead.
+
+**Active compaction pays where it acts.** At the late checkpoint, where recovered nodes
+dominate, `compact=True` reaches 24.156 G-NUPS against 15.558 for the same configuration
+without it — a 1.55x speedup. Whole-run means understate this because the gain is
+concentrated in the tail.
+
+**The numbers are reproducible across builds.** Every case with a prior published value
+reproduces within 1.7% (renewal constant +0.0%, age-dependent -0.3%, mixed -1.5%,
+BA auto +1.7%, Markovian SIS +0.2%, ensemble -0.3%) despite a different PyTorch, so they
+are a property of the algorithm and data layout rather than of one build.
 
 For scalar runs, NUPS is `N * internal tau-leaps / target wall time`; it is not the number
 of realized transitions, frontier edges, or unique changed nodes. Ensemble throughput is

@@ -1,0 +1,12 @@
+{
+  "num_nodes": 65536,
+  "replicas": 32,
+  "storage_profile": "fused_seir",
+  "accepted_transitions": 195051,
+  "expected_transitions": 194844.22412109375,
+  "sigma": 441.41162662654654,
+  "z_score": 0.46844230290560834,
+  "min_changed_per_replica": 5328,
+  "max_changed_per_replica": 6918,
+  "distinct_replica_states": 32
+}
