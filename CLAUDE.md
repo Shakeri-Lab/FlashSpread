@@ -123,11 +123,13 @@ per-replica reductions, and a tiled transition phase.
 - Bernoulli tau-leaping is approximate. Validate tolerance sensitivity and exact-reference
   agreement for the intended model and observable; do not claim a universal fidelity floor.
 - Counter-based sampling has a width contract. Triton's `philox` picks its word width from
-  the *counter* dtype, so a 64-bit counter returns uint64 words that no longer compare
-  against `_bernoulli_from_words`' uint32 threshold — which scales every event probability
-  by `2**-32`. Lane identities wider than one uint32 go in a second counter word via
-  `_sample_bernoulli_counter`; never pack them into one 64-bit word. `tl.static_assert`
-  guards this, and `tests/test_rng_contract.py` pins it without a GPU.
+  the *counter* dtype, and 64-bit random words no longer compare against
+  `_bernoulli_from_words`' uint32 threshold — which scales every event probability by
+  `2**-32`. Whether a 64-bit counter actually widens the words is *version-dependent*
+  (measured: 3.1.0/3.2.0/3.3.1 widen, 3.6.0/3.7.1 do not), so never rely on the observed
+  behaviour: lane identities wider than one uint32 go in a second counter word via
+  `_sample_bernoulli_counter`. `tl.static_assert` guards the invariant, and
+  `tests/test_rng_contract.py` asserts the safety property on any version without a GPU.
 
 ### Supported Triton versions, measured
 
@@ -141,6 +143,7 @@ tiled ensemble path and probing `tl.randint4x` under four Triton versions (SLURM
 | 3.2.0 | 64 | compiles and runs |
 | 3.3.1 | 64 | compiles and runs |
 | 3.6.0 | 32 | compiles and runs |
+| 3.7.1 | 32 | compiles and runs (GitHub CI resolves this) |
 
 Two lessons. First, `>=2.1` advertised a GPU feature that cannot compile. Second, Philox's
 word width is *version-dependent*, so never rely on it: keep counters in uint32 words and
