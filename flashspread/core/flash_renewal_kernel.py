@@ -314,7 +314,12 @@ if _HAS_TRITON:
         lo = tl.zeros([EDGES_PER_BLOCK], dtype=tl.int32)
         hi = tl.zeros([EDGES_PER_BLOCK], dtype=tl.int32) + (N + 1)
         for _ in tl.static_range(BSEARCH_ITERS):
-            mid = (lo + hi) // 2
+            # Overflow-safe midpoint. ``(lo + hi) // 2`` wraps to a negative
+            # int32 once lo + hi exceeds 2**31 - 1, i.e. for N > 2**30: the
+            # clamp below then forces below=True, drives lo negative, and the
+            # search converges on a fixed *wrong* row, silently attributing
+            # every affected edge's pressure to the wrong target.
+            mid = lo + ((hi - lo) >> 1)
             row_mid = tl.load(row_ptr_ptr + tl.minimum(tl.maximum(mid, 0), N))
             row_mid = tl.where(mid > N, E + 1, row_mid)
             below = row_mid <= edge32

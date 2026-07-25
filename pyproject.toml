@@ -43,7 +43,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["triton>=2.1"]
+# The tiled ensemble rate kernel uses `tl.range(..., loop_unroll_factor=)`, which
+# Triton added in 3.2. On 3.1 that kernel fails to *compile*, so the declared
+# `>=2.1` floor advertised a GPU feature that could not run. Verified on an A100:
+# 3.1.0 raises CompilationError; 3.2.0, 3.3.1 and 3.6.0 all run.
+gpu = ["triton>=3.2"]
 graph = ["networkx>=3.0"]
 reorder = ["scipy>=1.10"]
 dev = [
@@ -57,7 +61,7 @@ dev = [
 docs = ["mkdocs-material", "mkdocstrings[python]"]
 # All optional *runtime* capabilities. Development and documentation tooling
 # remain explicit extras and are not pulled into a user's simulation install.
-all = ["triton>=2.1", "networkx>=3.0", "scipy>=1.10"]
+all = ["triton>=3.2", "networkx>=3.0", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/Shakeri-Lab/FlashSpread"

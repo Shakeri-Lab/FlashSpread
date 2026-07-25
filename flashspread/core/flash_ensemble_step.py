@@ -13,14 +13,23 @@ The transition kernel independently validates every tau so direct low-level
 use cannot mutate an invalid replica.
 """
 
-from __future__ import annotations
+# NOTE: deliberately no `from __future__ import annotations`. Triton's
+# interpreter resolves constexpr parameters with an exact
+# `_normalize_ty(annotation) == "constexpr"` comparison, so a stringified
+# `"tl.constexpr"` annotation stops being recognized and `tl.arange` then
+# rejects its bounds. The compiled path uses a substring test and is
+# unaffected, which is why this only ever broke interpreter-mode tests.
 
 import math
 import operator
 
 import torch
 
-from .flash_rng import _event_probability, _mix_rng_key, _sample_bernoulli
+from .flash_rng import (
+    _event_probability,
+    _mix_rng_key,
+    _sample_bernoulli_counter,
+)
 from ..utils import validate_fp32_control
 
 try:
@@ -158,12 +167,20 @@ if _HAS_TRITON:
         step_id = tl.load(step_id_ptr).to(tl.uint64)
 
         # One full-width key identifies the event seed and accepted simulation
-        # step. Replica and node identities occupy disjoint uint32 halves of the
-        # Philox counter, hence every [N, R] lane has a unique stream position
-        # independent of launch tiling.
+        # step. Node and replica identities occupy two disjoint uint32 *counter
+        # words*, hence every [N, R] lane has a unique stream position
+        # independent of launch tiling. They must not be packed into one 64-bit
+        # word: Philox picks its word width from the counter dtype, so a uint64
+        # counter returns uint64 random words that no longer compare against the
+        # uint32 threshold (see _bernoulli_from_words).
         key = _mix_rng_key(base_seed, step_id)
-        rng_offset = (replica.to(tl.uint64)[None, :] << 32) | node.to(tl.uint64)[:, None]
-        event = _sample_bernoulli(probability, key, rng_offset)
+        node_counter = tl.broadcast_to(node.to(tl.uint32)[:, None], probability.shape)
+        replica_counter = tl.broadcast_to(
+            replica.to(tl.uint32)[None, :], probability.shape
+        )
+        event = _sample_bernoulli_counter(
+            probability, key, node_counter, replica_counter
+        )
         event &= lane_mask & valid_tau[None, :]
 
         is_s = state == 0
@@ -384,7 +401,9 @@ def transition_ensemble_seir(
     Stateful tensors use contiguous node-major ``[N, R]`` storage. ``rng_seed``
     and ``step_id`` are scalar int64 CUDA tensors and are read-only. They form
     one full-width event-seed/accepted-step key. Each lane uses the unique
-    uint64 counter ``(replica << 32) | node``. ``event_partials`` must have
+    two-word uint32 Philox counter ``(node, replica)``; the two ids stay in
+    separate counter words because a packed 64-bit counter changes Philox's
+    word width. ``event_partials`` must have
     shape ``[ceil(N / node_tile), R]`` and receives int32 changed-node counts
     without final-count atomics. When ``infectious_mask`` is supplied, it is a
     persistent int32 bit-pattern tensor with shape ``[N, ceil(R/32)]``;

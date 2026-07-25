@@ -1,6 +1,11 @@
 """Sparse GPU primitives for Markovian frontier updates."""
 
-from __future__ import annotations
+# NOTE: deliberately no `from __future__ import annotations`. Triton's
+# interpreter resolves constexpr parameters with an exact
+# `_normalize_ty(annotation) == "constexpr"` comparison, so a stringified
+# `"tl.constexpr"` annotation stops being recognized and `tl.arange` then
+# rejects its bounds. The compiled path uses a substring test and is
+# unaffected, which is why this only ever broke interpreter-mode tests.
 
 import torch
 

@@ -112,12 +112,58 @@ per-replica reductions, and a tiled transition phase.
 - `precision="mixed"` requires the fused renewal backend and is valid with warp traversal.
 - Model parameters are copied into the engine at construction, and CUDA Graphs bind fixed
   storage. Rebuild the engine after changing model parameters, graph topology, weights, or
-  intervention policy; there is no live control API.
+  intervention policy; there is no live control API. `RenewalEngineFused` enforces this with
+  `_assert_control_unchanged()` beside the existing `GraphCSR._assert_unchanged`, because
+  `epsilon`/`tau_max` are runtime kernel arguments: mutating them used to take effect on the
+  eager engine (bypassing constructor validation) while the captured engine kept the frozen
+  values, so the same attribute meant two different things.
 - `reset()` reproduces the base random stream. `reset(episode=k)` derives an independent
-  episode stream. Engines maintain private, full-width random streams; do not replace them
-  with process-global RNG calls in hot paths.
+  episode stream by *mixing* `(base_seed, k)`, not by adding them. Engines maintain private,
+  full-width random streams; do not replace them with process-global RNG calls in hot paths.
 - Bernoulli tau-leaping is approximate. Validate tolerance sensitivity and exact-reference
   agreement for the intended model and observable; do not claim a universal fidelity floor.
+- Counter-based sampling has a width contract. Triton's `philox` picks its word width from
+  the *counter* dtype, so a 64-bit counter returns uint64 words that no longer compare
+  against `_bernoulli_from_words`' uint32 threshold — which scales every event probability
+  by `2**-32`. Lane identities wider than one uint32 go in a second counter word via
+  `_sample_bernoulli_counter`; never pack them into one 64-bit word. `tl.static_assert`
+  guards this, and `tests/test_rng_contract.py` pins it without a GPU.
+
+### Supported Triton versions, measured
+
+The declared `gpu` floor is `triton>=3.2`, not `>=2.1`. Measured on one A100 by running the
+tiled ensemble path and probing `tl.randint4x` under four Triton versions (SLURM jobs
+17309977 / 17310442):
+
+| Triton | `randint4x` word width for a **uint64** counter | tiled ensemble kernel |
+|---|---|---|
+| 3.1.0 | 64 (would break a uint32 threshold) | **does not compile** — `tl.range(loop_unroll_factor=)` is 3.2+ |
+| 3.2.0 | 64 | compiles and runs |
+| 3.3.1 | 64 | compiles and runs |
+| 3.6.0 | 32 | compiles and runs |
+
+Two lessons. First, `>=2.1` advertised a GPU feature that cannot compile. Second, Philox's
+word width is *version-dependent*, so never rely on it: keep counters in uint32 words and
+let the `tl.static_assert` in `_bernoulli_from_words` enforce it.
+
+### Behaviour changes and what they do (not) invalidate
+
+- **Ensemble trajectories: version-dependent, and the A100 baseline is unaffected.** The
+  historical packed 64-bit counter collapsed every transition probability to `p * 2**-32`
+  *only on the Triton versions that widen the Philox words*. Measured with the historical
+  code in place, 20 steps, 32 replicas, seed 7: Triton 3.2.0 and 3.3.1 accepted **0**
+  transitions in every replica, while 3.6.0 accepted 99-170. With the two-word counter all
+  three versions accept 99-170 identically. So recorded ensemble trajectories produced on
+  **Triton 3.6.0 (including the A100 acceptance runs and every manuscript figure) remain
+  valid**; anything produced on 3.2.x or 3.3.x is invalid. Timing measurements were never
+  affected either way, because the acceptance harness restores fixed checkpoints and the
+  step costs the same whether or not an event is accepted.
+- **Episode streams.** `reset(episode=k)` for `k != 0` now yields different streams.
+  `reset()`, `reset(episode=0)` and every base-seed run are bitwise unchanged.
+- **Large-N initial conditions.** `seed_infection` draws seeds with `sample_distinct_nodes`,
+  which keeps the historical `randperm(N)[:k]` for `N <= 2**22` and switches to O(k)
+  rejection sampling above it. Initial conditions at or below ~4.19M nodes are therefore
+  bitwise unchanged; larger populations select different nodes from the same distribution.
 
 ## Graph construction
 
@@ -146,16 +192,33 @@ ruff check flashspread tests examples \
   experiments/ensemble_perf_model.py
 ```
 
-For GPU tests, install `.[dev,gpu]` and run `python -m pytest -m gpu`. The latest complete
-local run is **347 passed, 45 skipped**; the selected final A100 validation is **73 passed**.
+For GPU tests, install `.[dev,gpu]` and run `python -m pytest -m gpu`, or submit
+`slurm/run_gpu_validation.sbatch`, which runs the whole `gpu` selection and writes a JSON
+report to shared storage. The latest complete local run collects **425 tests**: the full
+invocation reports **370 passed, 55 skipped**, and `-m "not gpu"` (what CI runs) reports
+**370 passed, 5 skipped, 50 deselected**. Measured on Python 3.11.14, PyTorch 2.5.1+cu121,
+Triton 3.1.0. Quote the environment whenever you quote the counts — the skip total moves
+with Triton and CUDA availability, so a bare number goes stale silently.
 
-Production acceptance harnesses:
+Kernel tests that execute under `TRITON_INTERPRET=1` are gated by
+`tests/_triton_support.py`, which probes the installed interpreter rather than pinning a
+version range. Triton 3.1 both rejects valid kernels and, worse, silently fails to deliver
+kernel stores to host tensors, which makes interpreter-mode assertions vacuous. Treat those
+tests as unavailable, not as coverage, unless the probe reports the interpreter usable.
+
+Production acceptance harnesses. All eight presets are evidence: the hub-heavy traversals
+decide whether `auto` dispatch is choosing correctly, and the compaction preset is the only
+measurement of `compact=True`.
 
 ```bash
 python experiments/benchmark_acceptance.py walltime --case regular-constant
 python experiments/benchmark_acceptance.py walltime --case regular-age
 python experiments/benchmark_acceptance.py walltime --case regular-mixed
+python experiments/benchmark_acceptance.py walltime --case regular-late-compact
 python experiments/benchmark_acceptance.py walltime --case ba-auto
+python experiments/benchmark_acceptance.py walltime --case ba-thread
+python experiments/benchmark_acceptance.py walltime --case ba-warp
+python experiments/benchmark_acceptance.py walltime --case ba-merge
 python experiments/benchmark_markovian.py walltime
 python experiments/benchmark_ensemble.py walltime --replicas 32
 ```

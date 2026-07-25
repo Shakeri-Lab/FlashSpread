@@ -49,11 +49,12 @@ from ..core.flash_renewal_kernel import (
 )
 from ..models.hazards import lognormal_hazard_stable
 from ..utils import (
+    sample_distinct_nodes,
     validate_compartment,
+    validate_fp32_control,
     validate_initial_tensors,
     validate_model_contract,
     validate_population_count,
-    validate_fp32_control,
 )
 
 
@@ -355,6 +356,24 @@ class RenewalEngineFused:
             # The merge kernel needs a scratch pressure buffer and an
             # unrolled binary-search depth that covers N.
             import math as _math
+
+            # The row search initializes its upper bound to N + 1 and its
+            # sentinel to E + 1, both in int32. Reject the two shapes where
+            # those sentinels are not representable rather than silently
+            # searching a wrapped interval. This is far above any graph that
+            # fits current device memory; it becomes moot when offsets widen
+            # to int64.
+            _int32_max = torch.iinfo(torch.int32).max
+            if self.num_nodes >= _int32_max:
+                raise OverflowError(
+                    "csr_strategy='merge' requires num_nodes < 2**31 - 1 so its "
+                    "row search can represent the N + 1 upper bound in int32"
+                )
+            if int(self.graph.col_ind.numel()) >= _int32_max:
+                raise OverflowError(
+                    "csr_strategy='merge' requires fewer than 2**31 - 1 directed "
+                    "edges so its row search can represent the E + 1 sentinel"
+                )
             self._pressure_scratch = torch.zeros(
                 self.num_nodes, device=self.device, dtype=torch.float32
             )
@@ -423,6 +442,41 @@ class RenewalEngineFused:
         self._sig_ir = None
         self._prepare_model_params()
 
+        # Graph storage has _assert_unchanged; the scalar controls had nothing.
+        # epsilon and tau_max are passed to _compute_tau as *runtime* kernel
+        # arguments, so mutating them silently took effect on the eager engine
+        # (bypassing the constructor's validate_fp32_control) while the captured
+        # engine kept the values frozen at capture. Snapshot them so both
+        # engines enforce the same documented contract: rebuild the engine.
+        self._control_signature = self._current_control_signature()
+
+    def _current_control_signature(self) -> tuple:
+        """Fingerprint the scalar controls compiled or captured into the step."""
+        return (
+            float(self.epsilon),
+            float(self.tau_max),
+            float(self._beta),
+            float(self._mu_ei),
+            float(self._sig_ei),
+            float(self._mu_ir),
+            float(self._sig_ir),
+            int(self._state_s),
+            int(self._state_e),
+            int(self._state_i),
+            int(self._state_r),
+            bool(self._transmission_age_dependent),
+        )
+
+    def _assert_control_unchanged(self) -> None:
+        """Reject scalar-control mutation after the engine bound its step."""
+        if self._current_control_signature() != self._control_signature:
+            raise RuntimeError(
+                f"{type(self).__name__} scalar controls changed after "
+                "construction. epsilon, tau_max, model parameters and the "
+                "transmission mode are construction-time inputs; construct a "
+                "new engine instead of mutating a running one."
+            )
+
     def _constant_infectivity_snapshot(self, state: torch.Tensor) -> torch.Tensor:
         """Materialize constant shedding only for diagnostic compatibility."""
         return torch.where(state == self._state_i, self._beta, 0.0).to(
@@ -484,9 +538,10 @@ class RenewalEngineFused:
         """Reset all simulation state for clean re-use (e.g., RL episodes).
 
         Args:
-            episode: If given, shift the effective RNG seed by ``episode``
-                so successive episodes are statistically independent.
-                Otherwise reset to the base seed (reproduces the first run).
+            episode: If given, derive an independent effective seed by
+                mixing ``(base_seed, episode)`` so successive episodes are
+                statistically independent. ``episode=0``/``None`` reset to the
+                base seed and reproduce the first run bitwise.
 
         """
         eff_seed = offset_seed(
@@ -521,9 +576,12 @@ class RenewalEngineFused:
             state = self._state_e  # default: Exposed for SEIR
         state = validate_compartment(state, self.model.num_states)
         num_infected = validate_population_count(num_infected, self.num_nodes)
-        indices = torch.randperm(
-            self.num_nodes, device=self.device, generator=self._init_gen
-        )[:num_infected]
+        indices = sample_distinct_nodes(
+                self.num_nodes,
+                num_infected,
+                device=self.device,
+                generator=self._init_gen,
+            )
         self.state[indices] = state
         self.age[indices] = 0.0
         # Bootstrap infectivity from the seeded state so the first kernel
@@ -755,6 +813,7 @@ class RenewalEngineFused:
         self.graph._assert_unchanged(
             self._graph_signature, owner=type(self).__name__
         )
+        self._assert_control_unchanged()
         self._launch_rates(
             self.state,
             self.age,
@@ -1030,6 +1089,7 @@ class RenewalEngineFusedCUDAGraph(RenewalEngineFused):
         self.graph._assert_unchanged(
             self._graph_signature, owner=type(self).__name__
         )
+        self._assert_control_unchanged()
         # Active-node compaction refresh: happens OUTSIDE the captured
         # graph. This is the only place we touch _active_nodes_buffer /
         # _num_active_device; the captured graph reads them at fixed

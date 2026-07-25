@@ -40,6 +40,7 @@ from ..core.host_rng import (
 )
 from ..utils import (
     is_markovian,
+    sample_distinct_nodes,
     validate_compartment,
     validate_fp32_control,
     validate_model_contract,
@@ -393,11 +394,12 @@ class ReferenceEnsembleEngine:
         state = validate_compartment(state, self.num_states)
         counts = self._normalize_counts(num_infected)
         for replica, count in enumerate(counts):
-            indices = torch.randperm(
+            indices = sample_distinct_nodes(
                 self.num_nodes,
+                count,
                 device=self.device,
                 generator=self._init_generators[replica],
-            )[:count]
+            )
             self.state[indices, replica] = state
             if self.age is not None:
                 self.age[indices, replica] = 0.0

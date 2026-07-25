@@ -8,6 +8,8 @@ import sys
 import pytest
 import torch
 
+from ._triton_support import triton_interpreter_skip_reason
+
 from flashspread.core.ensemble_reference import (
     reference_ensemble_infectivity_csr,
     reference_ensemble_influence_csr,
@@ -20,6 +22,11 @@ from flashspread.engines.ensemble import (
     _supports_builtin_seir_rate_fusion,
 )
 from flashspread.models import SEIRModel, SISModel
+
+_REQUIRES_TRITON_INTERPRETER = pytest.mark.skipif(
+    triton_interpreter_skip_reason() is not None,
+    reason=triton_interpreter_skip_reason() or "",
+)
 
 
 def _weighted_graph() -> GraphCSR:
@@ -954,10 +961,7 @@ def test_gpu_ensemble_beta_is_a_strict_fp32_scalar(beta):
         ensemble_influence_csr(graph, state, 1, beta=beta)
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("triton") is None,
-    reason="Triton is an optional GPU dependency",
-)
+@_REQUIRES_TRITON_INTERPRETER
 def test_triton_ensemble_gather_interpreter_all_payload_weight_modes():
     """Exercise partial tiles and both constexpr branches without a GPU."""
     repository = Path(__file__).resolve().parents[1]
@@ -1058,10 +1062,7 @@ for weighted in (False, True):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("triton") is None,
-    reason="Triton is an optional GPU dependency",
-)
+@_REQUIRES_TRITON_INTERPRETER
 def test_triton_ensemble_seir_rate_interpreter_all_parameter_weight_modes():
     """Protect the fused rate path across partial tiles and all branches."""
     repository = Path(__file__).resolve().parents[1]
@@ -1421,10 +1422,7 @@ for partial, (start, stop) in enumerate(((0, 128), (128, 130))):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("triton") is None,
-    reason="Triton is an optional GPU dependency",
-)
+@_REQUIRES_TRITON_INTERPRETER
 def test_triton_ensemble_step_tail_interpreter_transaction_and_rng_contract():
     """Exercise status precedence, in-place ages, counts, and tile-stable RNG."""
     repository = Path(__file__).resolve().parents[1]

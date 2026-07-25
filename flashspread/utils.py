@@ -190,6 +190,64 @@ def validate_population_count(value: int, num_nodes: int) -> int:
     return value
 
 
+# Above this population, ``randperm(N)`` stops being an acceptable way to draw a
+# handful of seed nodes: it costs 8N result bytes plus sort workspace (~32-40N
+# transient in total) and O(N log N) time, which at N=1e8 is several GB committed
+# *after* every steady-state buffer. Below it, randperm is kept deliberately so
+# that every initial condition reproducible today stays bitwise reproducible.
+_RANDPERM_MAX_NODES = 1 << 22
+
+
+def sample_distinct_nodes(
+    num_nodes: int,
+    count: int,
+    *,
+    device,
+    generator,
+) -> "_Tensor":
+    """Draw ``count`` distinct node ids uniformly, without an O(N) permutation.
+
+    Small populations keep the historical ``randperm(N)[:count]`` path so their
+    seeded initial conditions are unchanged. Large populations switch to
+    rejection sampling whose storage is O(count).
+
+    The rejection path must not simply truncate a deduplicated batch:
+    ``torch.unique`` returns sorted values, so a prefix would be biased towards
+    low node ids. Selecting a random subset of the distinct draws instead keeps
+    the procedure symmetric in the node labels, which is what makes the result a
+    uniform random subset.
+    """
+    import torch
+
+    if count <= 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    # Rejection sampling is only worthwhile for a sparse draw from a large
+    # population; otherwise the retry loop dominates and randperm is better.
+    if num_nodes <= _RANDPERM_MAX_NODES or count * 8 >= num_nodes:
+        return torch.randperm(num_nodes, device=device, generator=generator)[:count]
+
+    distinct = torch.empty(0, dtype=torch.int64, device=device)
+    while distinct.numel() < count:
+        shortfall = count - distinct.numel()
+        # Over-draw so the expected number of retries stays small even once the
+        # birthday-paradox collision rate bites.
+        batch = shortfall + shortfall // 2 + 16
+        draw = torch.randint(
+            0,
+            num_nodes,
+            (batch,),
+            device=device,
+            dtype=torch.int64,
+            generator=generator,
+        )
+        distinct = torch.unique(torch.cat((distinct, draw)))
+
+    selection = torch.randperm(
+        distinct.numel(), device=device, generator=generator
+    )[:count]
+    return distinct[selection]
+
+
 def validate_initial_tensors(
     initial_state,
     *,

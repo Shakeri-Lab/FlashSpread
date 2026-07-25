@@ -841,12 +841,26 @@ class TestRenewalEngineFused:
         from flashspread.engines.renewal_fused import RenewalEngineFusedCUDAGraph
         from flashspread import SEIRModel, FixedDegreeGraph
 
+        from flashspread.core.host_rng import offset_seed, signed_int64
+
         graph = FixedDegreeGraph(128, 8, device="cuda", seed=2)
         engine = RenewalEngineFusedCUDAGraph(
             graph, SEIRModel(), device="cuda", seed=11, steps_per_launch=2
         )
+        base = int(engine._rng_seed.item())
+
+        # The point of this test is that reset(episode=...) reaches the device
+        # buffer the captured graph reads, without recapture. Assert that
+        # through the public derivation rather than a hard-coded sum: episode
+        # seeds are deliberately mixed, not added, because base_seed + episode
+        # made (seed=11, episode=7) and (seed=18, episode=0) the same stream.
         engine.reset(episode=7)
-        assert int(engine._rng_seed.item()) == 18
+        episode_seed = int(engine._rng_seed.item())
+        assert episode_seed != base
+        assert episode_seed == signed_int64(offset_seed(11, 7))
+
+        engine.reset()
+        assert int(engine._rng_seed.item()) == base
 
     def test_compacted_pingpong_clears_stale_alternate_infectivity(self):
         from flashspread import GraphCSR, SEIRModel

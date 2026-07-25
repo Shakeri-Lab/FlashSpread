@@ -58,7 +58,7 @@ On a CUDA-capable host, install the `gpu` extra or pass `device="cpu"` explicitl
 
 | Extra | Dependency | Capability |
 |---|---|---|
-| `gpu` | `triton>=2.1` | Triton GPU kernels |
+| `gpu` | `triton>=3.2` | Triton GPU kernels |
 | `graph` | `networkx>=3.0` | NetworkX-backed graph generators |
 | `reorder` | `scipy>=1.10` | reverse Cuthill-McKee preprocessing |
 | `all` | all runtime extras | GPU, graph generation, and reordering |
@@ -287,7 +287,10 @@ batch size up to the next even value; inspect `sim.steps_per_launch` for the eff
 window.
 
 `reset()` reproduces the base random stream. `reset(episode=k)` derives an independent
-episode stream from `base_seed + k`. Engine-owned model parameters are copied at
+episode stream by mixing `(base_seed, k)`. That derivation is deliberately not
+`base_seed + k`, which made `(seed=100, episode=1)` and `(seed=101, episode=0)` the same
+stream and collapsed an `S x E` sweep to `S + E - 1` distinct streams; `k = 0` still
+reproduces the base stream bitwise. Engine-owned model parameters are copied at
 construction, so mutating the original model does not update a running simulation.
 
 ## Performance snapshot
@@ -368,9 +371,23 @@ ruff check flashspread tests \
   experiments/ensemble_perf_model.py
 ```
 
-CUDA/Triton tests skip automatically when a GPU is unavailable. The latest complete local
-run reports **347 passed, 45 skipped**; the final selected A100 validation reports
-**73 passed**.
+CUDA/Triton tests skip automatically when a GPU is unavailable. The suite collects
+**425 tests**; on a CPU-only host the full invocation reports **370 passed, 55 skipped**,
+and `-m "not gpu"` reports **370 passed, 5 skipped, 50 deselected** (Python 3.11.14,
+PyTorch 2.5.1+cu121, Triton 3.1.0). Counts depend on the environment, so they are quoted
+with it.
+
+Every push and pull request runs Ruff and the CPU suite on Python 3.10-3.12
+([`.github/workflows/ci.yml`](https://github.com/Shakeri-Lab/FlashSpread/blob/main/.github/workflows/ci.yml)),
+and publishing to PyPI reuses that workflow as a gate. GPU coverage is not reachable from
+CI: submit [`slurm/run_gpu_validation.sbatch`](https://github.com/Shakeri-Lab/FlashSpread/blob/main/slurm/run_gpu_validation.sbatch),
+which runs the whole `gpu` selection and writes a JSON report.
+
+A handful of tests execute real Triton kernels through `TRITON_INTERPRET=1` to get
+device-free kernel coverage. That interpreter is not uniformly capable across supported
+Triton versions — and when it is incapable it can silently fail to deliver kernel stores to
+host tensors, which would make its assertions vacuous — so those tests probe the installed
+interpreter and skip with a reason rather than passing emptily.
 
 ## Citation
 

@@ -15,6 +15,7 @@ STREAM_STRIDE = -3335678366873096957  # 0xD1B54A32D192ED03
 GLOBAL_GENERATOR_DOMAIN = 0xA0761D6478BD642F
 INITIAL_CONDITION_DOMAIN = 0xE7037ED1A0B428DB
 MARKOV_GENERATOR_DOMAIN = 0x8EBC6AF09C88C6E3
+EPISODE_DOMAIN = 0xC2B2AE3D27D4EB4F
 
 
 def normalize_seed(seed: int, *, name: str = "seed") -> int:
@@ -34,14 +35,30 @@ def normalize_seed(seed: int, *, name: str = "seed") -> int:
 
 
 def offset_seed(base_seed: int, offset: int, *, name: str = "offset") -> int:
-    """Add an episode/stream offset with explicit uint64 wraparound."""
+    """Derive an independent episode/stream seed from ``base_seed``.
+
+    Offset zero returns ``base_seed`` unchanged so ``reset()`` keeps reproducing
+    the first run bitwise.
+
+    Every nonzero offset is mixed rather than added. Plain addition made the
+    derived seed depend only on ``base_seed + offset``, so ``(100, episode=1)``
+    and ``(101, episode=0)`` produced bitwise identical streams and an
+    ``S x E`` sweep yielded only ``S + E - 1`` distinct streams instead of
+    ``S * E`` -- biasing any variance or extinction-probability estimate
+    downwards with no visible symptom. Mixing both arguments through separate
+    SplitMix64 rounds under a dedicated domain constant makes the pair
+    ``(base_seed, offset)`` injective in practice.
+    """
     if isinstance(offset, bool):
         raise TypeError(f"{name} must be an integer, not bool")
     try:
         offset = operator.index(offset)
     except TypeError as exc:
         raise TypeError(f"{name} must be an integer") from exc
-    return (base_seed + offset) & UINT64_MASK
+    if offset == 0:
+        return base_seed & UINT64_MASK
+    mixed_offset = splitmix64_word((offset & UINT64_MASK) ^ EPISODE_DOMAIN)
+    return splitmix64_word(splitmix64_word(base_seed) ^ mixed_offset)
 
 
 def signed_int64(word: int) -> int:
@@ -114,6 +131,7 @@ __all__ = [
     "SPLITMIX_MULTIPLIER_1",
     "SPLITMIX_MULTIPLIER_2",
     "STREAM_STRIDE",
+    "EPISODE_DOMAIN",
     "GLOBAL_GENERATOR_DOMAIN",
     "INITIAL_CONDITION_DOMAIN",
     "MARKOV_GENERATOR_DOMAIN",

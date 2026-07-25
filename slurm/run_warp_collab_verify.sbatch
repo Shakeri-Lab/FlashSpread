@@ -35,7 +35,9 @@ echo "=== [B] Smoke tests (fused engine still passes) ==="
 python -m pytest \
     tests/smoke_test.py::TestRenewalEngineFused \
     tests/smoke_test.py::TestRenewalEngineNonMarkov \
-    -v -s || echo "!!! Smoke tests FAILED — continuing to Phase C"
+    -v -s
+# A correctness gate must fail the job. Swallowing this with `|| echo` let a
+# broken kernel go on to produce throughput numbers that looked publishable.
 echo ""
 
 # --- Phase C: throughput comparison on ER + BA at N=10^6 ---

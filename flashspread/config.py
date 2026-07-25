@@ -93,6 +93,80 @@ def supports_fused_renewal(model) -> bool:
     return True
 
 
+def supports_builtin_markovian(model) -> str | None:
+    """Return ``"sis"``/``"sir"`` when ``model`` has exact built-in GPU semantics.
+
+    This is the Markovian counterpart of :func:`supports_fused_renewal`, and it
+    exists for the same reason: the Triton SIS/SIR pipeline hard-codes the
+    built-in rate expressions and the compartment transition map, so it never
+    calls the model's Python hooks. A bare ``type(model) is SISModel`` check is
+    therefore not sufficient — an instance whose ``apply_transitions`` has been
+    shadowed still passes it, and the kernel would silently substitute the
+    built-in equations for the user's.
+
+    Returning ``None`` selects the generic PyTorch path, which honours every
+    hook, so a rejected model loses performance rather than correctness.
+    """
+    model_type = type(model)
+    if model_type.__module__ != "flashspread.models.compartmental":
+        return None
+    kind = {"SISModel": "sis", "SIRModel": "sir"}.get(model_type.__qualname__)
+    if kind is None:
+        return None
+
+    from .models.compartmental import (
+        SIRModel,
+        SISModel,
+        _SIR_FUSED_BUILTIN_HOOKS,
+        _SIS_FUSED_BUILTIN_HOOKS,
+    )
+
+    if kind == "sis":
+        expected_type, hooks, num_states = SISModel, _SIS_FUSED_BUILTIN_HOOKS, 2
+        rate_attribute = "delta"
+    else:
+        expected_type, hooks, num_states = SIRModel, _SIR_FUSED_BUILTIN_HOOKS, 3
+        rate_attribute = "gamma"
+    if model_type is not expected_type:
+        return None
+
+    required = ("susceptible", "infected", "num_states", "beta", rate_attribute)
+    if not all(hasattr(model, name) for name in required):
+        return None
+    if kind == "sir" and not hasattr(model, "recovered"):
+        return None
+
+    state_names = ("susceptible", "infected")
+    if kind == "sir":
+        state_names += ("recovered",)
+    state_ids = tuple(getattr(model, name, None) for name in state_names)
+    try:
+        inducer_states = tuple(model.inducer_states)
+    except TypeError:
+        return None
+    if (
+        getattr(model, "is_markovian", None) is not True
+        or type(getattr(model, "num_states", None)) is not int
+        or model.num_states != num_states
+        or not all(type(state_id) is int for state_id in state_ids)
+        or state_ids != tuple(range(num_states))
+        # The frontier kernel treats infected as the sole inducer. The generic
+        # rebuild honours a wider set, so the two would silently disagree.
+        or inducer_states != (1,)
+    ):
+        return None
+
+    # Reject an instance-level shadow even when it happens to wrap the base
+    # function: the exact built-in contract must be explicit at dispatch time.
+    instance_attributes = getattr(model, "__dict__", {})
+    for name, original_hook in hooks:
+        if name in instance_attributes:
+            return None
+        if getattr(getattr(model, name, None), "__func__", None) is not original_hook:
+            return None
+    return kind
+
+
 @dataclass(frozen=True, slots=True)
 class _ResolvedEnginePlan:
     """Private typed boundary between policy resolution and construction."""

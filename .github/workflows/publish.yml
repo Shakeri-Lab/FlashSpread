@@ -12,8 +12,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Nothing reaches PyPI that has not passed lint and the CPU suite. Reusing the
+  # CI workflow keeps one definition of "green" instead of a second, weaker copy
+  # that can silently drift from the one contributors run.
+  verify:
+    name: Verify
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build distributions
+    needs: verify
     runs-on: ubuntu-24.04
 
     steps:
@@ -82,7 +90,7 @@ jobs:
 
   publish:
     name: Publish distributions
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-24.04
     environment:
       name: pypi

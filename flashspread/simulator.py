@@ -39,6 +39,34 @@ from .utils import (
 )
 
 
+def _same_device(requested, actual) -> bool:
+    """Whether two devices name the same physical storage.
+
+    An unindexed request such as ``torch.device("cuda")`` is not equal to the
+    ``cuda:0`` an engine rebinds itself to, and neither is their string form, so
+    resolve the default index before comparing. Torch is imported lazily: this
+    helper only ever runs once a live engine exists.
+    """
+    import torch
+
+    requested = torch.device(requested)
+    actual = torch.device(actual)
+    if requested.type != actual.type:
+        return False
+    if requested.index is None or actual.index is None:
+        # One side left the index to PyTorch. Resolve it the same way PyTorch
+        # would for that device type rather than declaring a mismatch.
+        default = (
+            torch.cuda.current_device()
+            if requested.type == "cuda" and torch.cuda.is_available()
+            else 0
+        )
+        return (requested.index if requested.index is not None else default) == (
+            actual.index if actual.index is not None else default
+        )
+    return requested.index == actual.index
+
+
 class Simulator:
     """High-level driver that selects and owns the appropriate engine.
 
@@ -87,6 +115,12 @@ class Simulator:
         self._build()
 
     def _build(self) -> None:
+        # Initial-condition bookkeeping. seed_infection installs an *initial*
+        # condition, so it must know whether the simulation has advanced and
+        # which compartments it has already populated.
+        self._has_stepped = False
+        self._seeded_compartments: set[int] = set()
+
         if self._seed is not None:
             seed_everything(self._seed)
         if self._engine_override is not None:
@@ -120,11 +154,21 @@ class Simulator:
                 "injected engine and graph disagree on num_nodes: "
                 f"{engine.num_nodes} != {graph_csr.num_nodes}"
             )
-        if hasattr(engine, "device") and str(self.device) != str(engine.device):
-            raise ValueError(
-                "injected engine and Simulator disagree on device: "
-                f"{engine.device} != {self.device}"
-            )
+        if hasattr(engine, "device"):
+            # Compare canonical devices, not their strings. Every engine rebinds
+            # itself to physical CSR storage (``cuda`` -> ``cuda:0``), so a raw
+            # string compare rejected the natural spelling
+            # ``Simulator(graph, model, device="cuda", engine=prebuilt)`` on a
+            # correct configuration. torch.device equality treats an unindexed
+            # request as distinct too, so resolve the index explicitly.
+            if not _same_device(self.device, engine.device):
+                raise ValueError(
+                    "injected engine and Simulator disagree on device: "
+                    f"{engine.device} != {self.device}"
+                )
+            # Adopt the engine's concrete device once validated, so the public
+            # attribute names the storage the simulation actually runs on.
+            self.device = engine.device
         engine_model = getattr(engine, "model", None)
         if engine_model is not None:
             if is_markovian(engine_model) != is_markovian(self.model):
@@ -157,9 +201,42 @@ class Simulator:
 
         The target compartment defaults to each model's natural entry state
         (Exposed for SEIR, Infected for SIS/SIR).
+
+        This sets an *initial* condition, so it is rejected once the simulation
+        has advanced. Seeding mid-run used to be accepted silently, injecting
+        fresh-age nodes into a live epidemic while the clock and any already
+        returned :class:`Trajectory` stayed untouched. Call
+        :meth:`reset` first, or use :meth:`set_initial_state` to install a
+        complete condition.
         """
+        if self._has_stepped:
+            raise RuntimeError(
+                "seed_infection sets an initial condition and cannot be called "
+                f"after the simulation has advanced (t={self.current_time!r}). "
+                "Call reset() first, or use set_initial_state(...)."
+            )
+        compartment = (
+            self._default_seed_compartment()
+            if state is None
+            else validate_compartment(state, self.model.num_states)
+        )
+        if compartment in self._seeded_compartments:
+            raise RuntimeError(
+                f"compartment {compartment} has already been seeded. Repeat "
+                "calls are not additive: the second draw can select nodes the "
+                "first already moved, so the requested totals are silently "
+                "under-delivered. Seed the full count in one call, or build the "
+                "exact condition with set_initial_state(...)."
+            )
         self._engine.seed_infection(num_infected, state)
+        self._seeded_compartments.add(compartment)
         return self
+
+    def _default_seed_compartment(self) -> int:
+        """The compartment ``seed_infection`` targets when none is given."""
+        if is_markovian(self.model):
+            return int(getattr(self.model, "infected", 1))
+        return int(getattr(self.model, "exposed", 1))
 
     def set_initial_state(self, state, age=None) -> "Simulator":
         """Set a complete initial condition and return ``self``.
@@ -182,17 +259,27 @@ class Simulator:
         one ``step()`` may return the summed duration of that window.
         """
         tau, _ = self._engine.step()      # engines differ in their 2nd element
+        self._has_stepped = True
         return float(tau)
 
     def reset(self, episode: int | None = None) -> "Simulator":
         """Reset engine state. Returns self.
 
-        With ``episode``, the RNG is reseeded to ``base_seed + episode`` so
-        successive RL episodes are independent rather than replaying one stream.
+        With ``episode``, the RNG is reseeded to a mixed derivation of
+        ``(base_seed, episode)`` so successive RL episodes are independent rather
+        than replaying one stream. ``episode=0`` and ``episode=None`` both
+        reproduce the base stream bitwise. The derivation is deliberately not
+        ``base_seed + episode``: that made ``(100, episode=1)`` and
+        ``(101, episode=0)`` the same stream, so a seed x episode sweep drew far
+        fewer distinct streams than it appeared to.
         """
         if self._seed is not None and episode is None:
             seed_everything(self._seed)
         self._engine.reset(episode=episode)
+        # A reset returns to t=0 with an empty population, so a fresh initial
+        # condition is legitimate again.
+        self._has_stepped = False
+        self._seeded_compartments.clear()
         return self
 
     # ---- observables -------------------------------------------------------

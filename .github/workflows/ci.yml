@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Ruff
+        run: python -m pip install ruff
+
+      # Keep this invocation identical to the one CLAUDE.md prescribes.
+      # tests/test_repo_hygiene.py asserts the two stay in sync, so a change
+      # here without a docs change fails the suite rather than drifting.
+      - name: Lint
+        run: |
+          ruff check flashspread tests examples \
+            experiments/benchmark_acceptance.py \
+            experiments/benchmark_markovian.py \
+            experiments/benchmark_ensemble.py \
+            experiments/perf_model.py \
+            experiments/ensemble_perf_model.py
+
+  test:
+    name: CPU tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package and its development extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Record the resolved environment
+        run: |
+          python -c "
+          import numpy, torch
+          print('torch', torch.__version__, 'cuda', torch.cuda.is_available())
+          print('numpy', numpy.__version__)
+          try:
+              import triton; print('triton', triton.__version__)
+          except Exception as exc:
+              print('triton absent:', exc)
+          "
+
+      # `-m "not gpu"` is explicit rather than relying on the conftest skip, so
+      # a CPU runner can never silently collect zero kernel tests and report
+      # green. `--strict-markers` fails on a typo'd marker instead of ignoring it.
+      - name: Run the CPU suite
+        run: python -m pytest -q -m "not gpu" --strict-markers
+
+      - name: Assert the suite is not vacuous
+        run: |
+          python - <<'PY'
+          import subprocess
+          out = subprocess.run(
+              ["python", "-m", "pytest", "-q", "-m", "not gpu", "--collect-only"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          collected = sum(1 for line in out.splitlines() if "::" in line)
+          print(f"collected {collected} CPU tests")
+          # Guards against a collection error or an over-broad skip silently
+          # reducing CI to a no-op. Raise this floor as the suite grows.
+          if collected < 250:
+              raise SystemExit(f"expected >= 250 CPU tests, collected {collected}")
+          PY
+
+  latest-deps:
+    # Advisory leg: the pinned matrix above is the gate. This one warns early
+    # when a new torch/triton release breaks the package -- which is exactly how
+    # the Triton interpreter tests went red unnoticed.
+    name: Latest dependencies (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install with the newest resolvable dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade -e ".[dev]"
+          python -m pip install --upgrade torch numpy
+
+      - name: Run the CPU suite
+        run: python -m pytest -q -m "not gpu" --strict-markers

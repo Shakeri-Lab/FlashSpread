@@ -532,3 +532,16 @@ _SEIR_FUSED_BUILTIN_HOOKS = tuple(
         "apply_transitions",
     )
 )
+
+# The Markovian Triton pipeline bypasses these hooks in exactly the same way the
+# fused renewal kernels bypass the SEIR ones, so its dispatch gate needs the same
+# reference identities to compare against.
+_SIS_FUSED_BUILTIN_HOOKS = tuple(
+    (name, getattr(SISModel, name))
+    for name in ("prepare", "compute_rates", "apply_transitions")
+)
+
+_SIR_FUSED_BUILTIN_HOOKS = tuple(
+    (name, getattr(SIRModel, name))
+    for name in ("prepare", "compute_rates", "apply_transitions")
+)

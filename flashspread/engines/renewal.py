@@ -32,11 +32,12 @@ from ..core.reference import (
     reference_influence_infectivity_csr,
 )
 from ..utils import (
+    sample_distinct_nodes,
     validate_compartment,
+    validate_fp32_control,
     validate_initial_tensors,
     validate_model_contract,
     validate_population_count,
-    validate_fp32_control,
 )
 
 
@@ -229,9 +230,12 @@ class RenewalEngine:
         state = validate_compartment(state, self.model.num_states)
         num_infected = validate_population_count(num_infected, self.num_nodes)
 
-        indices = torch.randperm(
-            self.num_nodes, device=self.device, generator=self._init_gen
-        )[:num_infected]
+        indices = sample_distinct_nodes(
+                self.num_nodes,
+                num_infected,
+                device=self.device,
+                generator=self._init_gen,
+            )
         self.state[indices] = state
         self.age[indices] = 0.0  # Fresh entry into state
 

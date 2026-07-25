@@ -26,11 +26,12 @@ from ..core.host_rng import (
 )
 from ..core.reference import reference_influence_csr
 from ..utils import (
+    sample_distinct_nodes,
     validate_compartment,
+    validate_fp32_control,
     validate_initial_tensors,
     validate_model_contract,
     validate_population_count,
-    validate_fp32_control,
 )
 
 
@@ -158,13 +159,11 @@ class MarkovianEngine:
         # rates and deterministic compartment transitions are fully described
         # by scalar parameters. Custom model protocols retain the generic
         # PyTorch path so no capability is lost.
-        from ..models.compartmental import SIRModel, SISModel
+        from ..config import supports_builtin_markovian
 
-        self._builtin_gpu_kind = None
-        if not self._cpu_fallback and type(model) is SISModel:
-            self._builtin_gpu_kind = "sis"
-        elif not self._cpu_fallback and type(model) is SIRModel:
-            self._builtin_gpu_kind = "sir"
+        self._builtin_gpu_kind = (
+            None if self._cpu_fallback else supports_builtin_markovian(model)
+        )
         if self._builtin_gpu_kind is not None:
             recovery_rate = (
                 float(model.delta)
@@ -181,9 +180,23 @@ class MarkovianEngine:
 
         # Sparse propagation needs the opposite orientation.  Build it from
         # canonical CSR so weights remain attached and no COO copy is retained.
+        #
+        # Aliasing incoming rows as outgoing rows requires more than structural
+        # symmetry. Entry k of incoming row u is the edge ``col_ind[k] -> u``, so
+        # reading that row as an outgoing row applies ``w(v -> u)`` where
+        # ``w(u -> v)`` is required. Structural symmetry does not imply weight
+        # symmetry, and a generated graph can acquire non-unit weights through
+        # the public ``csr.weights`` compatibility setter while keeping its
+        # ``_GeneratedGraph`` wrapper. Unit weights are the only case where the
+        # two orientations are interchangeable, so restrict the alias to them and
+        # let every weighted graph pay for a real transpose.
         if self._cpu_fallback:
             self.outgoing_graph = None
-        elif self._builtin_gpu_kind is not None and graph_is_symmetric:
+        elif (
+            self._builtin_gpu_kind is not None
+            and graph_is_symmetric
+            and not self.graph.has_weights
+        ):
             self.outgoing_graph = self.graph
         else:
             self.outgoing_graph = self.graph.transpose()
@@ -268,7 +281,15 @@ class MarkovianEngine:
             self._event_count_device = self._event_count_levels[-1]
             self._probability_scale = -math.log1p(-self.max_prob)
             self._target_events = self.theta * self.num_nodes
+            # Snapshot both rate parameters. Reading model.beta at every launch
+            # made mutating it silently take effect -- bypassing the validation
+            # above -- while a mutated recovery rate was silently ignored, so the
+            # documented "parameters are copied at construction" contract held
+            # for one parameter and not the other.
             self._recovery_rate = recovery_rate
+            self._beta = float(model.beta)
+            self._state_s = int(model.susceptible)
+            self._state_i = int(model.infected)
         else:
             self._rate_sum_levels = None
             self._rate_max_levels = None
@@ -295,7 +316,8 @@ class MarkovianEngine:
         """Reset simulation to initial state.
 
         Args:
-            episode: If given, reseed with ``base_seed + episode`` so
+            episode: If given, reseed with a mixed derivation of
+                ``(base_seed, episode)`` -- not their sum -- so
                 successive RL episodes draw independent randomness;
                 otherwise reset to the base seed (reproduces the first run).
         """
@@ -339,9 +361,12 @@ class MarkovianEngine:
         state = validate_compartment(state, self.model.num_states)
         num_infected = validate_population_count(num_infected, self.num_nodes)
 
-        indices = torch.randperm(
-            self.num_nodes, device=self.device, generator=self._rng
-        )[:num_infected]
+        indices = sample_distinct_nodes(
+                self.num_nodes,
+                num_infected,
+                device=self.device,
+                generator=self._rng,
+            )
         self.state[indices] = state
 
         # Recompute influence and rates
@@ -401,11 +426,11 @@ class MarkovianEngine:
             rates_ptr=self.rates,
             total_rate_ptr=self._rate_sum_levels[0],
             max_rate_ptr=self._rate_max_levels[0],
-            beta=float(self.model.beta),
+            beta=self._beta,
             recovery_rate=self._recovery_rate,
             N=self.num_nodes,
-            STATE_S=int(self.model.susceptible),
-            STATE_I=int(self.model.infected),
+            STATE_S=self._state_s,
+            STATE_I=self._state_i,
             BLOCK_SIZE=block_size,
         )
         for level in range(len(self._rate_sum_levels) - 1):
@@ -603,8 +628,8 @@ class MarkovianEngine:
             step_id_ptr=self._step_id_device,
             event_count_ptr=self._event_count_levels[0],
             N=self.num_nodes,
-            STATE_S=int(self.model.susceptible),
-            STATE_I=int(self.model.infected),
+            STATE_S=self._state_s,
+            STATE_I=self._state_i,
             STATE_R=recovered,
             MODEL_SIS=1 if self._builtin_gpu_kind == "sis" else 0,
             HAS_WEIGHTS=self.outgoing_graph.has_weights,
@@ -761,14 +786,16 @@ class MarkovianEngineCUDAGraph(MarkovianEngine):
         seed: int = 12345,
         steps_per_launch: int = 50,
     ):
-        from ..models.compartmental import SIRModel, SISModel
+        from ..config import supports_builtin_markovian
 
         if torch.device(device).type != "cuda":
             raise RuntimeError("CUDA Graph execution requires a CUDA device")
-        if type(model) not in (SISModel, SIRModel):
+        if supports_builtin_markovian(model) is None:
             raise TypeError(
-                "Markovian CUDA Graph execution supports the built-in "
-                "SISModel and SIRModel only"
+                "Markovian CUDA Graph execution supports the exact, unmodified "
+                "built-in SISModel and SIRModel only; subclasses and models with "
+                "shadowed rate/transition hooks must use the eager engine, whose "
+                "generic path calls those hooks"
             )
         if isinstance(steps_per_launch, bool):
             raise TypeError("steps_per_launch must be an integer, not bool")
