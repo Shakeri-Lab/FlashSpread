@@ -197,9 +197,9 @@ ruff check flashspread tests examples \
 
 For GPU tests, install `.[dev,gpu]` and run `python -m pytest -m gpu`, or submit
 `slurm/run_gpu_validation.sbatch`, which runs the whole `gpu` selection and writes a JSON
-report to shared storage. The latest complete local run collects **425 tests**: the full
-invocation reports **370 passed, 55 skipped**, and `-m "not gpu"` (what CI runs) reports
-**370 passed, 5 skipped, 50 deselected**. Measured on Python 3.11.14, PyTorch 2.5.1+cu121,
+report to shared storage. The latest complete local run collects **426 tests**: the full
+invocation reports **371 passed, 55 skipped**, and `-m "not gpu"` (what CI runs) reports
+**371 passed, 5 skipped, 50 deselected**. Measured on Python 3.11.14, PyTorch 2.5.1+cu121,
 Triton 3.1.0. Quote the environment whenever you quote the counts — the skip total moves
 with Triton and CUDA availability, so a bare number goes stale silently.
 

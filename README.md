@@ -372,8 +372,8 @@ ruff check flashspread tests \
 ```
 
 CUDA/Triton tests skip automatically when a GPU is unavailable. The suite collects
-**425 tests**; on a CPU-only host the full invocation reports **370 passed, 55 skipped**,
-and `-m "not gpu"` reports **370 passed, 5 skipped, 50 deselected** (Python 3.11.14,
+**426 tests**; on a CPU-only host the full invocation reports **371 passed, 55 skipped**,
+and `-m "not gpu"` reports **371 passed, 5 skipped, 50 deselected** (Python 3.11.14,
 PyTorch 2.5.1+cu121, Triton 3.1.0). Counts depend on the environment, so they are quoted
 with it.
 
